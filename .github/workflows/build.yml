@@ -12,10 +12,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Get version from tag
+        id: get_version
+        shell: bash
+        run: |
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          else
+            echo "version=dev" >> $GITHUB_OUTPUT
+          fi
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.13'
 
       - name: Install dependencies
         run: |
@@ -29,23 +39,32 @@ jobs:
 
       - name: Create Windows archive
         run: |
-          Compress-Archive -Path dist/yt-dlp-gui.exe -DestinationPath yt-dlp-gui-windows.zip
+          Compress-Archive -Path dist/yt-dlp-gui.exe -DestinationPath yt-dlp-gui-${{ steps.get_version.outputs.version }}-windows.zip
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
           name: yt-dlp-gui-windows
-          path: yt-dlp-gui-windows.zip
+          path: yt-dlp-gui-${{ steps.get_version.outputs.version }}-windows.zip
 
   build-macos:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
+      - name: Get version from tag
+        id: get_version
+        run: |
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          else
+            echo "version=dev" >> $GITHUB_OUTPUT
+          fi
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.13'
 
       - name: Install dependencies
         run: |
@@ -57,27 +76,59 @@ jobs:
         run: |
           pyinstaller build-specs/yt-dlp-gui-mac.spec --clean
 
+      - name: Optimize macOS app bundle
+        run: |
+          echo "1. Thinning universal binaries to arm64 only..."
+          find dist/yt-dlp-gui.app -type f | while read file; do
+            if file "$file" | grep -q "Mach-O"; then
+              if file "$file" | grep -q "universal"; then
+                echo "Thinning: $file"
+                lipo "$file" -thin arm64 -output "${file}.tmp" && mv "${file}.tmp" "$file"
+                codesign --force --sign - "$file" 2>/dev/null || true
+              fi
+            fi
+          done
+          
+          echo "2. Converting duplicate framework 'Current' directories to symlinks..."
+          find dist/yt-dlp-gui.app -type d -name "Versions" | while read versions_dir; do
+            if [ -d "$versions_dir/Current" ] && [ ! -L "$versions_dir/Current" ]; then
+              echo "Fixing: $versions_dir/Current"
+              rm -rf "$versions_dir/Current"
+              ln -s A "$versions_dir/Current"
+            fi
+          done
+          
+          echo "Optimization complete!"
+
       - name: Create macOS archive
         run: |
-          cd dist
-          zip -r ../yt-dlp-gui-mac.zip yt-dlp-gui.app
-          cd ..
+          # Use ditto instead of zip to properly preserve symlinks
+          ditto -c -k --sequesterRsrc --keepParent dist/yt-dlp-gui.app yt-dlp-gui-${{ steps.get_version.outputs.version }}-mac.zip
 
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
         with:
           name: yt-dlp-gui-macos
-          path: yt-dlp-gui-mac.zip
+          path: yt-dlp-gui-${{ steps.get_version.outputs.version }}-mac.zip
 
   build-linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      - name: Get version from tag
+        id: get_version
+        run: |
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          else
+            echo "version=dev" >> $GITHUB_OUTPUT
+          fi
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.13'
 
       - name: Install dependencies
         run: |
@@ -92,14 +143,14 @@ jobs:
       - name: Create Linux archive
         run: |
           cd dist
-          tar -czf ../yt-dlp-gui-linux.tar.gz yt-dlp-gui/
+          tar -czf ../yt-dlp-gui-${{ steps.get_version.outputs.version }}-linux.tar.gz yt-dlp-gui/
           cd ..
 
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
         with:
           name: yt-dlp-gui-linux
-          path: yt-dlp-gui-linux.tar.gz
+          path: yt-dlp-gui-${{ steps.get_version.outputs.version }}-linux.tar.gz
 
   create-release:
     needs: [build-windows, build-macos, build-linux]
@@ -115,9 +166,9 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            artifacts/yt-dlp-gui-windows/yt-dlp-gui-windows.zip
-            artifacts/yt-dlp-gui-macos/yt-dlp-gui-mac.zip
-            artifacts/yt-dlp-gui-linux/yt-dlp-gui-linux.tar.gz
+            artifacts/yt-dlp-gui-windows/yt-dlp-gui-*-windows.zip
+            artifacts/yt-dlp-gui-macos/yt-dlp-gui-*-mac.zip
+            artifacts/yt-dlp-gui-linux/yt-dlp-gui-*-linux.tar.gz
           draft: false
           prerelease: false
           generate_release_notes: true
