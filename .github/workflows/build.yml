@@ -162,8 +162,13 @@ jobs:
         with:
           path: artifacts
 
+      - name: Extract latest changelog section
+        run: |
+          # Extract content between first ## and second ## (latest version only)
+          awk '/^## \[/{if(++count==2) exit; if(count==1) flag=1; next} flag' CHANGELOG.md > release_notes.md
+
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: |
             artifacts/yt-dlp-gui-windows/yt-dlp-gui-*-windows.zip
@@ -171,6 +176,6 @@ jobs:
             artifacts/yt-dlp-gui-linux/yt-dlp-gui-*-linux.tar.gz
           draft: false
           prerelease: false
-          generate_release_notes: true
+          body_path: release_notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
