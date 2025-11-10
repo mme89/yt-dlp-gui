@@ -4,10 +4,10 @@
 block_cipher = None
 
 a = Analysis(
-    ['yt-dlp-gui.py'],
+    ['../yt-dlp-gui.py'],
     pathex=[],
     binaries=[],
-    datas=[('assets', 'assets')],
+    datas=[('../assets', 'assets')],
     hiddenimports=['PySide6.QtCore', 'PySide6.QtGui', 'PySide6.QtWidgets'],
     hookspath=[],
     hooksconfig={},
@@ -53,7 +53,7 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='yt-dlp-gui.app',
-    icon='assets/logo.png',
+    icon='../assets/logo.png',
     bundle_identifier='com.mme89.yt-dlp-gui',
     version='1.0.0',
     info_plist={
