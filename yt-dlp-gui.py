@@ -332,14 +332,6 @@ class YtDlpGUI(QMainWindow):
                 width: 20px;
             }}
 
-            QComboBox::down-arrow {{
-                image: none;
-                border-left: 4px solid transparent;
-                border-right: 4px solid transparent;
-                border-top: 6px solid {self.COLORS['text_secondary']};
-                margin-right: 8px;
-            }}
-
             QComboBox QAbstractItemView {{
                 background-color: {self.COLORS['surface']};
                 border: 1px solid {self.COLORS['border']};
@@ -506,13 +498,13 @@ class YtDlpGUI(QMainWindow):
 
             logo_pixmap = QPixmap(str(logo_path))
             self.about_logo_label.setPixmap(logo_pixmap.scaled(
-                128, 128, 
+                128, 128,
                 Qt.KeepAspectRatio, 
                 Qt.SmoothTransformation
             ))
 
     def init_ui(self):
-        self.setWindowTitle("mme89 yt-dlp GUI - v1.0")
+        self.setWindowTitle("mme89 yt-dlp GUI - v1.1.0")
         self.setFixedSize(1200, 900)
 
         central_widget = QWidget()
@@ -949,6 +941,11 @@ class YtDlpGUI(QMainWindow):
         self.show_terminal_checkbox.stateChanged.connect(self.toggle_terminal_output)
         layout.addWidget(self.show_terminal_checkbox)
 
+        layout.addSpacing(5)
+
+        self.show_auto_captions_checkbox = QCheckBox("Show auto-generated captions in subtitle dropdown")
+        layout.addWidget(self.show_auto_captions_checkbox)
+
         layout.addSpacing(10)
 
         self.save_settings_btn = QPushButton("Save Settings")
@@ -991,7 +988,7 @@ class YtDlpGUI(QMainWindow):
         app_title.setFont(app_title_font)
         version_layout.addWidget(app_title)
         
-        version_label = QLabel("Version 1.0")
+        version_label = QLabel("Version 1.1.0")
         version_label.setStyleSheet(f"color: {self.COLORS['text_secondary']};")
         version_layout.addWidget(version_label)
         
@@ -1247,14 +1244,32 @@ class YtDlpGUI(QMainWindow):
                 self.ytdlp_version = "Not found"
                 self.ytdlp_version_label.setText("⚠️ yt-dlp not found - Please install it")
                 self.ytdlp_version_label.setStyleSheet(f"color: {self.COLORS['error']}; font-weight: bold;")
-                QMessageBox.warning(
-                    self,
-                    "yt-dlp Not Found",
-                    "yt-dlp is not installed or not in your PATH.\n\n"
-                    "Please install it:\n"
-                    "• macOS: brew install yt-dlp\n"
-                    "• Or visit: https://github.com/yt-dlp/yt-dlp"
-                )
+                
+                if sys.platform == 'darwin':
+                    install_msg = (
+                        "yt-dlp is not installed or not in your PATH.\n\n"
+                        "Please install it:\n"
+                        "• Using Homebrew: brew install yt-dlp\n"
+                        "• Or visit: https://github.com/yt-dlp/yt-dlp"
+                    )
+                elif sys.platform == 'win32':
+                    install_msg = (
+                        "yt-dlp is not installed or not in your PATH.\n\n"
+                        "Please install it:\n"
+                        "• Using winget: winget install yt-dlp\n"
+                        "• Using Chocolatey: choco install yt-dlp\n"
+                        "• Or visit: https://github.com/yt-dlp/yt-dlp"
+                    )
+                else:
+                    install_msg = (
+                        "yt-dlp is not installed or not in your PATH.\n\n"
+                        "Please install it:\n"
+                        "• Using pip: pip install yt-dlp\n"
+                        "• Using your package manager (e.g., apt, dnf, pacman)\n"
+                        "• Or visit: https://github.com/yt-dlp/yt-dlp"
+                    )
+                
+                QMessageBox.warning(self, "yt-dlp Not Found", install_msg)
         except Exception as e:
             self.ytdlp_version = "Error checking version"
             self.ytdlp_version_label.setText("Error checking yt-dlp version")
@@ -1337,6 +1352,7 @@ class YtDlpGUI(QMainWindow):
     def on_formats_fetched(self, data):
         formats = data.get('formats', [])
         self.subtitles = data.get('subtitles', {})
+        self.automatic_captions = data.get('automatic_captions', {})
 
         self.video_combo.clear()
         self.audio_combo.clear()
@@ -1383,17 +1399,29 @@ class YtDlpGUI(QMainWindow):
         video_formats.sort(key=lambda x: x[2].get('height', 0), reverse=True)
         for label, fid, _ in video_formats[:20]:
             self.video_combo.addItem(label, fid)
+        self.video_combo.addItem("No video (audio only)", "none")
 
         self.audio_combo.addItem("Best audio", "bestaudio")
         audio_formats.sort(key=lambda x: x[2].get('abr', 0), reverse=True)
         for label, fid, _ in audio_formats[:15]:
             self.audio_combo.addItem(label, fid)
+        self.audio_combo.addItem("No audio (video only)", "none")
 
         self.subtitle_combo.addItem("None", "")
-        if self.subtitles:
+
+        has_subtitles = bool(self.subtitles or self.automatic_captions)
+        
+        if has_subtitles:
             self.subtitle_combo.addItem("All available", "all")
-            for lang_code in sorted(self.subtitles.keys()):
-                self.subtitle_combo.addItem(lang_code, lang_code)
+
+            if self.subtitles:
+                for lang_code in sorted(self.subtitles.keys()):
+                    self.subtitle_combo.addItem(f"{lang_code} (manual)", lang_code)
+
+            if self.automatic_captions:
+                for lang_code in sorted(self.automatic_captions.keys()):
+                    if lang_code not in self.subtitles:
+                        self.subtitle_combo.addItem(f"{lang_code} (auto)", lang_code)
         else:
             self.subtitle_combo.addItem("English (if available)", "en")
 
@@ -1550,7 +1578,20 @@ class YtDlpGUI(QMainWindow):
                 format_id = "best"
                 format_display = "best"
 
+            if video_id == "none" and audio_id == "none":
+                QMessageBox.warning(self, "Error", "Cannot download with both video and audio set to 'none'!")
+                return
+            elif video_id == "none":
+                format_id = audio_id if audio_id else "bestaudio"
+                format_display = "audio only"
+            elif audio_id == "none":
+                format_id = video_id if video_id else "bestvideo"
+                format_display = "video only"
+
         args = ["-f", format_id]
+
+        if video_id == "none" and not manual_format:
+            args.extend(["-x", "--audio-format", "mp3"])
 
         subtitle_lang = self.subtitle_combo.currentData()
         if subtitle_lang:
@@ -1657,7 +1698,20 @@ class YtDlpGUI(QMainWindow):
                 format_id = "best"
                 format_display = "best"
 
+            if video_id == "none" and audio_id == "none":
+                QMessageBox.warning(self, "Error", "Cannot download with both video and audio set to 'none'!")
+                return
+            elif video_id == "none":
+                format_id = audio_id if audio_id else "bestaudio"
+                format_display = "audio only"
+            elif audio_id == "none":
+                format_id = video_id if video_id else "bestvideo"
+                format_display = "video only"
+
         args = ["-f", format_id]
+
+        if video_id == "none" and not manual_format:
+            args.extend(["-x", "--audio-format", "mp3"])
 
         subtitle_lang = self.subtitle_combo.currentData()
         if subtitle_lang:
@@ -1807,7 +1861,9 @@ class YtDlpGUI(QMainWindow):
         destination = self.destination_input.text().strip()
         if destination:
             destination = os.path.expanduser(destination)
-            args = ["-P", destination] + args
+        else:
+            destination = os.path.expanduser("~/Downloads")
+        args = ["-P", destination] + args
 
         ffmpeg_path = self.get_ffmpeg_path()
         if ffmpeg_path and ffmpeg_path != "ffmpeg":
@@ -2126,7 +2182,9 @@ class YtDlpGUI(QMainWindow):
         destination = self.destination_input.text().strip()
         if destination:
             destination = os.path.expanduser(destination)
-            args = ["-P", destination] + args
+        else:
+            destination = os.path.expanduser("~/Downloads")
+        args = ["-P", destination] + args
 
         ffmpeg_path = self.get_ffmpeg_path()
         if ffmpeg_path and ffmpeg_path != "ffmpeg":

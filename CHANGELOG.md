@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.0] - 2025-01-11
+
+### Added
+- Application logo in About tab and window icon
+- Auto-generated subtitle/caption support with toggle option in settings
+- "No audio" and "No video" options for video-only or audio-only downloads
+- Platform-specific installation instructions for yt-dlp
+- Cross-platform executable finder (searches common installation paths)
+- Default download location set to ~/Downloads if not configured
+
+### Changed
+- Subtitle dropdown now shows both manual subtitles and auto-generated captions (when enabled)
+- Manual subtitles marked with "(manual)", auto-captions marked with "(auto)"
+- Improved dropdown arrow styling (removed custom CSS triangle)
+
+### Fixed
+- Built apps now find yt-dlp and ffmpeg in common installation locations
+- Downloads no longer go to random directories when destination not set
+
 ## [1.0.1] - 2025-11-11
 
 ### Added
