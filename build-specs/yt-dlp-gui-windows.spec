@@ -14,7 +14,6 @@ a = Analysis(
     runtime_hooks=[],
     excludes=[
         # Unused Qt modules (safe to exclude)
-        'PySide6.QtNetwork',
         'PySide6.QtOpenGL',
         'PySide6.QtOpenGLWidgets',
         'PySide6.QtPrintSupport',

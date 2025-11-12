@@ -8,7 +8,6 @@ import os
 import sys
 import json
 import asyncio
-import urllib.request
 from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -16,8 +15,9 @@ from PySide6.QtWidgets import (
     QGroupBox, QCheckBox, QFileDialog, QMessageBox, QProgressBar,
     QTableWidget, QTableWidgetItem, QHeaderView
 )
-from PySide6.QtCore import Qt, QThread, Signal, QProcess, QByteArray
+from PySide6.QtCore import Qt, QThread, Signal, QProcess, QByteArray, QUrl
 from PySide6.QtGui import QFont, QPixmap, QColor, QIcon
+from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
 
 class TerminalWindow(QWidget):
     """Separate window for terminal output"""
@@ -233,6 +233,7 @@ class YtDlpGUI(QMainWindow):
         self.current_queue_item = None
         self.format_data = {}
         self.current_playlist_downloads = []
+        self.network_manager = QNetworkAccessManager()
 
         self.init_ui()
         self.setup_logo()
@@ -499,12 +500,12 @@ class YtDlpGUI(QMainWindow):
             logo_pixmap = QPixmap(str(logo_path))
             self.about_logo_label.setPixmap(logo_pixmap.scaled(
                 128, 128,
-                Qt.KeepAspectRatio, 
+                Qt.KeepAspectRatio,
                 Qt.SmoothTransformation
             ))
 
     def init_ui(self):
-        self.setWindowTitle("mme89 yt-dlp GUI - v1.1.0")
+        self.setWindowTitle("mme89 yt-dlp GUI - v1.2.0")
         self.setFixedSize(1200, 900)
 
         central_widget = QWidget()
@@ -944,6 +945,7 @@ class YtDlpGUI(QMainWindow):
         layout.addSpacing(5)
 
         self.show_auto_captions_checkbox = QCheckBox("Show auto-generated captions in subtitle dropdown")
+        self.show_auto_captions_checkbox.stateChanged.connect(self.refresh_subtitle_dropdown)
         layout.addWidget(self.show_auto_captions_checkbox)
 
         layout.addSpacing(10)
@@ -967,36 +969,36 @@ class YtDlpGUI(QMainWindow):
 
         header_layout = QHBoxLayout()
         header_layout.addStretch()
-        
+
         self.about_logo_label = QLabel()
         self.about_logo_label.setFixedSize(128, 128)
         self.about_logo_label.setScaledContents(True)
         self.about_logo_label.setAlignment(Qt.AlignCenter)
         header_layout.addWidget(self.about_logo_label)
-        
+
         header_layout.addSpacing(20)
-        
+
         version_widget = QWidget()
         version_layout = QVBoxLayout(version_widget)
         version_layout.setContentsMargins(0, 0, 0, 0)
         version_layout.setAlignment(Qt.AlignVCenter)
-        
+
         app_title = QLabel("mme89 yt-dlp GUI")
         app_title_font = QFont()
         app_title_font.setPointSize(16)
         app_title_font.setBold(True)
         app_title.setFont(app_title_font)
         version_layout.addWidget(app_title)
-        
-        version_label = QLabel("Version 1.1.0")
+
+        version_label = QLabel("Version 1.2.0")
         version_label.setStyleSheet(f"color: {self.COLORS['text_secondary']};")
         version_layout.addWidget(version_label)
-        
+
         header_layout.addWidget(version_widget)
         header_layout.addStretch()
-        
+
         layout.addLayout(header_layout)
-        
+
         layout.addSpacing(20)
 
         desc_label = QLabel(
@@ -1040,7 +1042,7 @@ class YtDlpGUI(QMainWindow):
         ytdlp_widget = QWidget()
         ytdlp_layout = QVBoxLayout(ytdlp_widget)
         ytdlp_layout.setContentsMargins(0, 0, 10, 0)
-        
+
         ytdlp_label = QLabel("yt-dlp")
         ytdlp_font = QFont()
         ytdlp_font.setPointSize(14)
@@ -1066,13 +1068,13 @@ class YtDlpGUI(QMainWindow):
         ytdlp_info.setOpenExternalLinks(True)
         ytdlp_layout.addWidget(ytdlp_info)
         ytdlp_layout.addStretch()
-        
+
         powered_by_layout.addWidget(ytdlp_widget)
 
         ffmpeg_widget = QWidget()
         ffmpeg_layout = QVBoxLayout(ffmpeg_widget)
         ffmpeg_layout.setContentsMargins(10, 0, 0, 0)
-        
+
         ffmpeg_label = QLabel("FFmpeg")
         ffmpeg_font = QFont()
         ffmpeg_font.setPointSize(14)
@@ -1097,9 +1099,9 @@ class YtDlpGUI(QMainWindow):
         ffmpeg_info.setOpenExternalLinks(True)
         ffmpeg_layout.addWidget(ffmpeg_info)
         ffmpeg_layout.addStretch()
-        
+
         powered_by_layout.addWidget(ffmpeg_widget)
-        
+
         layout.addLayout(powered_by_layout)
 
         layout.addStretch()
@@ -1167,7 +1169,7 @@ class YtDlpGUI(QMainWindow):
         """Find executable in common locations across platforms"""
         if os.path.isfile(name) and os.access(name, os.X_OK):
             return name
-        
+
         common_paths = []
 
         if sys.platform == 'darwin':
@@ -1201,21 +1203,21 @@ class YtDlpGUI(QMainWindow):
         for path in common_paths:
             if os.path.isfile(path) and os.access(path, os.X_OK):
                 return path
-        
+
         try:
             import subprocess
             if sys.platform == 'win32':
                 result = subprocess.run(['where', name], capture_output=True, text=True)
             else:
                 result = subprocess.run(['which', name], capture_output=True, text=True)
-            
+
             if result.returncode == 0:
                 found_path = result.stdout.strip().split('\n')[0]
                 if found_path and os.path.isfile(found_path):
                     return found_path
         except:
             pass
-        
+
         return name
 
     def get_ytdlp_path(self):
@@ -1244,7 +1246,7 @@ class YtDlpGUI(QMainWindow):
                 self.ytdlp_version = "Not found"
                 self.ytdlp_version_label.setText("⚠️ yt-dlp not found - Please install it")
                 self.ytdlp_version_label.setStyleSheet(f"color: {self.COLORS['error']}; font-weight: bold;")
-                
+
                 if sys.platform == 'darwin':
                     install_msg = (
                         "yt-dlp is not installed or not in your PATH.\n\n"
@@ -1268,7 +1270,7 @@ class YtDlpGUI(QMainWindow):
                         "• Using your package manager (e.g., apt, dnf, pacman)\n"
                         "• Or visit: https://github.com/yt-dlp/yt-dlp"
                     )
-                
+
                 QMessageBox.warning(self, "yt-dlp Not Found", install_msg)
         except Exception as e:
             self.ytdlp_version = "Error checking version"
@@ -1336,6 +1338,10 @@ class YtDlpGUI(QMainWindow):
 
         self.download_page_status_label.setText("Fetching formats...")
         self.analyze_btn.setEnabled(False)
+
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False)
+        self.status_label.setText("")
 
         if self.terminal_window and self.terminal_window.isVisible():
             self.terminal_window.clear()
@@ -1409,8 +1415,9 @@ class YtDlpGUI(QMainWindow):
 
         self.subtitle_combo.addItem("None", "")
 
-        has_subtitles = bool(self.subtitles or self.automatic_captions)
-        
+        show_auto_captions = self.show_auto_captions_checkbox.isChecked()
+        has_subtitles = bool(self.subtitles or (self.automatic_captions and show_auto_captions))
+
         if has_subtitles:
             self.subtitle_combo.addItem("All available", "all")
 
@@ -1418,7 +1425,7 @@ class YtDlpGUI(QMainWindow):
                 for lang_code in sorted(self.subtitles.keys()):
                     self.subtitle_combo.addItem(f"{lang_code} (manual)", lang_code)
 
-            if self.automatic_captions:
+            if self.automatic_captions and show_auto_captions:
                 for lang_code in sorted(self.automatic_captions.keys()):
                     if lang_code not in self.subtitles:
                         self.subtitle_combo.addItem(f"{lang_code} (auto)", lang_code)
@@ -1495,14 +1502,7 @@ class YtDlpGUI(QMainWindow):
 
         thumbnail_url = data.get('thumbnail', '')
         if thumbnail_url:
-            try:
-                with urllib.request.urlopen(thumbnail_url) as response:
-                    image_data = response.read()
-                    pixmap = QPixmap()
-                    pixmap.loadFromData(QByteArray(image_data))
-                    self.thumbnail_label.setPixmap(pixmap)
-            except Exception as e:
-                self.thumbnail_label.setText(f"Failed to load thumbnail")
+            self.load_thumbnail(thumbnail_url)
         else:
             self.thumbnail_label.setText("No thumbnail available")
 
@@ -1513,6 +1513,67 @@ class YtDlpGUI(QMainWindow):
         QMessageBox.critical(self, "Error", f"Failed to fetch formats: {error}")
         self.download_page_status_label.setText("Error fetching formats")
         self.analyze_btn.setEnabled(True)
+
+    def refresh_subtitle_dropdown(self):
+        """Refresh subtitle dropdown when auto-captions checkbox is toggled"""
+        if not hasattr(self, 'subtitles') or not hasattr(self, 'automatic_captions'):
+            return
+
+        current_selection = self.subtitle_combo.currentData()
+
+        self.subtitle_combo.clear()
+        self.subtitle_combo.addItem("None", "")
+
+        show_auto_captions = self.show_auto_captions_checkbox.isChecked()
+        has_subtitles = bool(self.subtitles or (self.automatic_captions and show_auto_captions))
+
+        if has_subtitles:
+            self.subtitle_combo.addItem("All available", "all")
+
+            if self.subtitles:
+                for lang_code in sorted(self.subtitles.keys()):
+                    self.subtitle_combo.addItem(f"{lang_code} (manual)", lang_code)
+
+            if self.automatic_captions and show_auto_captions:
+                for lang_code in sorted(self.automatic_captions.keys()):
+                    if lang_code not in self.subtitles:
+                        self.subtitle_combo.addItem(f"{lang_code} (auto)", lang_code)
+        else:
+            self.subtitle_combo.addItem("English (if available)", "en")
+
+        for i in range(self.subtitle_combo.count()):
+            if self.subtitle_combo.itemData(i) == current_selection:
+                self.subtitle_combo.setCurrentIndex(i)
+                break
+
+    def load_thumbnail(self, url):
+        """Load thumbnail using QtNetwork for better PyInstaller compatibility"""
+        try:
+            request = QNetworkRequest(QUrl(url))
+            reply = self.network_manager.get(request)
+            reply.finished.connect(lambda: self.on_thumbnail_loaded(reply))
+        except Exception as e:
+            self.thumbnail_label.setText("Failed to load thumbnail")
+
+    def on_thumbnail_loaded(self, reply):
+        """Handle thumbnail download completion"""
+        try:
+            if reply.error() == QNetworkReply.NoError:
+                image_data = reply.readAll()
+                pixmap = QPixmap()
+                if pixmap.loadFromData(image_data):
+                    self.thumbnail_label.setPixmap(pixmap)
+                else:
+                    self.thumbnail_label.setText("Failed to load thumbnail")
+            else:
+                error_string = reply.errorString()
+                print(f"Network error loading thumbnail: {error_string}")
+                self.thumbnail_label.setText("Failed to load thumbnail")
+        except Exception as e:
+            print(f"Exception loading thumbnail: {e}")
+            self.thumbnail_label.setText("Failed to load thumbnail")
+        finally:
+            reply.deleteLater()
 
     def download_video(self):
         url = self.url_input.text().strip()

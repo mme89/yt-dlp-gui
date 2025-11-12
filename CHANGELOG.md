@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.0] - 2025-11-12
+
+### Added
+- QtNetwork-based thumbnail loading for better PyInstaller compatibility
+- Debug output for thumbnail loading errors
+
+### Changed
+- Switched from urllib to PySide6.QtNetwork for thumbnail downloads
+- Improved thumbnail loading reliability in built applications
+
+### Fixed
+- Download progress bar and status now properly reset when clicking "Analyze" for a new video
+- Thumbnail loading now works correctly in PyInstaller-built applications
+- "Show auto-generated captions" checkbox now properly filters subtitle dropdown
+- Auto-generated captions only appear when checkbox is enabled
+- Subtitle dropdown refreshes immediately when toggling auto-captions checkbox
+- PySide6.QtNetwork no longer excluded from build specs
+
 ## [1.1.0] - 2025-01-11
 
 ### Added
