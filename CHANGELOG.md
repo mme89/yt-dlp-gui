@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.0] - 2026-04-12
+
+### Added
+- About page status for JavaScript runtime detection used by yt-dlp
+- About page status for `yt-dlp-ejs` availability in the current Python environment
+- Subtitle option to include live chat when downloading all subtitles
+- Subtitle option to keep separate subtitle files in addition to embedding them
+- Helper text explaining default subtitle embedding behavior
+
+### Changed
+- Updated yt-dlp metadata fetch to use `--print "%()j"` instead of `--print-json`
+- Updated subtitle listing to use `--print automatic_captions_table --print subtitles_table`
+- Replaced deprecated subtitle option aliases with current yt-dlp forms
+- Auto-detect supported JavaScript runtimes for yt-dlp, preferring configured or available runtimes
+- "All subtitles" now excludes live chat by default unless explicitly enabled
+- Subtitle downloads now embed subtitles by default and only keep subtitle files when requested
+
 ## [1.2.0] - 2025-11-12
 
 ### Added

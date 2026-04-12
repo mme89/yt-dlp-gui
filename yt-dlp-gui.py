@@ -8,6 +8,9 @@ import os
 import sys
 import json
 import asyncio
+import shutil
+import shlex
+import importlib.util
 from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -24,7 +27,7 @@ class TerminalWindow(QWidget):
     closed = Signal()
 
     def __init__(self, parent=None):
-        super().__init__(parent, Qt.Window)
+        super().__init__(parent, Qt.WindowType.Window)
         self.setWindowTitle("Terminal Output - yt-dlp")
         self.setMinimumSize(800, 500)
 
@@ -74,30 +77,32 @@ class FormatFetcher(QThread):
     error = Signal(str)
     output = Signal(str)
 
-    def __init__(self, url, ytdlp_path="yt-dlp"):
+    def __init__(self, url, ytdlp_path="yt-dlp", extra_args=None):
         super().__init__()
         self.url = url
         self.ytdlp_path = ytdlp_path
+        self.extra_args = extra_args or []
 
     def run(self):
         try:
+            cmd_args = self.extra_args + ["-J", self.url]
             self.output.emit(f"Analyzing video: {self.url}\n")
-            self.output.emit(f"Running: {self.ytdlp_path} -J\n")
+            self.output.emit(f"Running: {self.ytdlp_path} {' '.join(cmd_args)}\n")
             self.output.emit("-" * 60 + "\n")
 
             process = QProcess()
-            process.start(self.ytdlp_path, ["-J", self.url])
+            process.start(self.ytdlp_path, cmd_args)
 
             self.output.emit("Fetching video information...\n")
             process.waitForFinished(-1)
 
             if process.exitCode() != 0:
-                error_output = process.readAllStandardError().data().decode('utf-8', errors='replace')
+                error_output = bytes(process.readAllStandardError().data()).decode('utf-8', errors='replace')
                 self.output.emit(f"\nError output:\n{error_output}\n")
                 self.error.emit("Failed to fetch formats")
                 return
 
-            output = process.readAllStandardOutput().data().decode('utf-8')
+            output = bytes(process.readAllStandardOutput().data()).decode('utf-8')
             self.output.emit("Successfully retrieved video information!\n")
             self.output.emit("-" * 60 + "\n")
 
@@ -132,11 +137,11 @@ class DownloadThread(QThread):
 
     def _handle_output(self):
         if self.process:
-            output = self.process.readAllStandardOutput().data().decode('utf-8', errors='replace')
+            output = bytes(self.process.readAllStandardOutput().data()).decode('utf-8', errors='replace')
             if output:
                 self.output.emit(output)
                 self._parse_progress(output)
-            error = self.process.readAllStandardError().data().decode('utf-8', errors='replace')
+            error = bytes(self.process.readAllStandardError().data()).decode('utf-8', errors='replace')
             if error:
                 self.output.emit(error)
 
@@ -183,7 +188,7 @@ class DownloadThread(QThread):
     def stop(self):
         """Request the download to stop"""
         self._should_stop = True
-        if self.process and self.process.state() == QProcess.Running:
+        if self.process and self.process.state() == QProcess.ProcessState.Running:
             try:
                 self.process.terminate()
             except:
@@ -228,6 +233,8 @@ class YtDlpGUI(QMainWindow):
         self.terminal_window = None
         self.ytdlp_version = None
         self.ffmpeg_version = None
+        self.js_runtime_version = None
+        self.ytdlp_ejs_status = None
         self.download_queue = []
         self.is_processing_queue = False
         self.current_queue_item = None
@@ -241,6 +248,8 @@ class YtDlpGUI(QMainWindow):
         self.load_settings()
         self.check_ytdlp_version()
         self.check_ffmpeg_version()
+        self.check_js_runtime_version()
+        self.check_ytdlp_ejs_status()
 
     def apply_stylesheet(self):
         """Apply consistent stylesheet across all platforms"""
@@ -500,12 +509,12 @@ class YtDlpGUI(QMainWindow):
             logo_pixmap = QPixmap(str(logo_path))
             self.about_logo_label.setPixmap(logo_pixmap.scaled(
                 128, 128,
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
             ))
 
     def init_ui(self):
-        self.setWindowTitle("mme89 yt-dlp GUI - v1.2.0")
+        self.setWindowTitle("mme89 yt-dlp GUI - v1.3.0")
         self.setFixedSize(1200, 900)
 
         central_widget = QWidget()
@@ -531,7 +540,7 @@ class YtDlpGUI(QMainWindow):
         self.thumbnail_label.setFixedSize(320, 180)
         self.thumbnail_label.setScaledContents(True)
         self.thumbnail_label.setStyleSheet(f"border: 1px solid {self.COLORS['border']}; background-color: {self.COLORS['thumbnail_bg']};")
-        self.thumbnail_label.setAlignment(Qt.AlignCenter)
+        self.thumbnail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.thumbnail_label.setText("Thumbnail will appear here")
         thumbnail_info_layout.addWidget(self.thumbnail_label)
 
@@ -598,11 +607,32 @@ class YtDlpGUI(QMainWindow):
 
         subtitle_group = QGroupBox("Subtitles")
         subtitle_layout = QVBoxLayout()
+        subtitle_row_layout = QHBoxLayout()
         self.subtitle_combo = QComboBox()
         self.subtitle_combo.addItem("None", "")
         self.subtitle_combo.addItem("English", "en")
-        self.subtitle_combo.addItem("All available", "all")
-        subtitle_layout.addWidget(self.subtitle_combo)
+        self.subtitle_combo.addItem("All subtitles", "all")
+        self.subtitle_combo.currentIndexChanged.connect(self.update_subtitle_option_states)
+        subtitle_row_layout.addWidget(self.subtitle_combo, 1)
+
+        self.include_live_chat_checkbox = QCheckBox("Include live chat")
+        self.include_live_chat_checkbox.setEnabled(False)
+        subtitle_row_layout.addWidget(self.include_live_chat_checkbox)
+
+        self.keep_subtitle_files_checkbox = QCheckBox("Keep subtitle files")
+        self.keep_subtitle_files_checkbox.setEnabled(False)
+        subtitle_row_layout.addWidget(self.keep_subtitle_files_checkbox)
+
+        subtitle_layout.addLayout(subtitle_row_layout)
+
+        subtitle_help = QLabel(
+            'By default, subtitles are embedded into the downloaded media. '
+            'Enable "Keep subtitle files" to also save separate subtitle files.'
+        )
+        subtitle_help.setWordWrap(True)
+        subtitle_help.setStyleSheet(f"color: {self.COLORS['text_secondary']}; font-size: 10pt;")
+        subtitle_layout.addWidget(subtitle_help)
+
         subtitle_group.setLayout(subtitle_layout)
         layout.addWidget(subtitle_group)
 
@@ -715,9 +745,9 @@ class YtDlpGUI(QMainWindow):
         self.playlist_table.setColumnWidth(1, 100)
         self.playlist_table.setColumnWidth(3, 80)
         self.playlist_table.setColumnWidth(4, 250)
-        self.playlist_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        self.playlist_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.playlist_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.playlist_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.playlist_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.playlist_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         layout.addWidget(self.playlist_table)
 
         self.playlist_status_label = QLabel("Enter a playlist URL and click 'Load Playlist'")
@@ -755,10 +785,10 @@ class YtDlpGUI(QMainWindow):
         self.queue_table.setColumnWidth(1, 100)
         self.queue_table.setColumnWidth(4, 100)
         self.queue_table.setColumnWidth(5, 80)
-        self.queue_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        self.queue_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
-        self.queue_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.queue_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.queue_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.queue_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.queue_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.queue_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.queue_table.verticalHeader().setVisible(False)
         layout.addWidget(self.queue_table)
 
@@ -965,7 +995,7 @@ class YtDlpGUI(QMainWindow):
     def create_about_tab(self):
         about_widget = QWidget()
         layout = QVBoxLayout(about_widget)
-        layout.setAlignment(Qt.AlignTop)
+        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
         header_layout = QHBoxLayout()
         header_layout.addStretch()
@@ -973,7 +1003,7 @@ class YtDlpGUI(QMainWindow):
         self.about_logo_label = QLabel()
         self.about_logo_label.setFixedSize(128, 128)
         self.about_logo_label.setScaledContents(True)
-        self.about_logo_label.setAlignment(Qt.AlignCenter)
+        self.about_logo_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         header_layout.addWidget(self.about_logo_label)
 
         header_layout.addSpacing(20)
@@ -981,7 +1011,7 @@ class YtDlpGUI(QMainWindow):
         version_widget = QWidget()
         version_layout = QVBoxLayout(version_widget)
         version_layout.setContentsMargins(0, 0, 0, 0)
-        version_layout.setAlignment(Qt.AlignVCenter)
+        version_layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
         app_title = QLabel("mme89 yt-dlp GUI")
         app_title_font = QFont()
@@ -990,7 +1020,7 @@ class YtDlpGUI(QMainWindow):
         app_title.setFont(app_title_font)
         version_layout.addWidget(app_title)
 
-        version_label = QLabel("Version 1.2.0")
+        version_label = QLabel("Version 1.3.0")
         version_label.setStyleSheet(f"color: {self.COLORS['text_secondary']};")
         version_layout.addWidget(version_label)
 
@@ -1006,7 +1036,7 @@ class YtDlpGUI(QMainWindow):
             "playlist support, and download queue management."
         )
         desc_label.setWordWrap(True)
-        desc_label.setAlignment(Qt.AlignCenter)
+        desc_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(desc_label)
 
         layout.addSpacing(5)
@@ -1014,9 +1044,9 @@ class YtDlpGUI(QMainWindow):
         github_label = QLabel(
             'GitHub: <a href="https://github.com/mme89/yt-dlp-gui">github.com/mme89/yt-dlp-gui</a>'
         )
-        github_label.setAlignment(Qt.AlignCenter)
-        github_label.setTextFormat(Qt.RichText)
-        github_label.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        github_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        github_label.setTextFormat(Qt.TextFormat.RichText)
+        github_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
         github_label.setOpenExternalLinks(True)
         github_label.setStyleSheet(f"color: {self.COLORS['text_secondary']};")
         layout.addWidget(github_label)
@@ -1028,9 +1058,9 @@ class YtDlpGUI(QMainWindow):
             '<a href="https://github.com/mme89/yt-dlp-gui/blob/main/LICENSE">View License</a>'
         )
         license_info.setWordWrap(True)
-        license_info.setAlignment(Qt.AlignCenter)
-        license_info.setTextFormat(Qt.RichText)
-        license_info.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        license_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        license_info.setTextFormat(Qt.TextFormat.RichText)
+        license_info.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
         license_info.setOpenExternalLinks(True)
         license_info.setStyleSheet(f"color: {self.COLORS['text_secondary']};")
         layout.addWidget(license_info)
@@ -1063,13 +1093,77 @@ class YtDlpGUI(QMainWindow):
             'GitHub: <a href="https://github.com/yt-dlp/yt-dlp">yt-dlp/yt-dlp</a>'
         )
         ytdlp_info.setWordWrap(True)
-        ytdlp_info.setTextFormat(Qt.RichText)
-        ytdlp_info.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        ytdlp_info.setTextFormat(Qt.TextFormat.RichText)
+        ytdlp_info.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
         ytdlp_info.setOpenExternalLinks(True)
         ytdlp_layout.addWidget(ytdlp_info)
         ytdlp_layout.addStretch()
 
         powered_by_layout.addWidget(ytdlp_widget)
+
+        js_runtime_widget = QWidget()
+        js_runtime_layout = QVBoxLayout(js_runtime_widget)
+        js_runtime_layout.setContentsMargins(10, 0, 10, 0)
+
+        js_runtime_label = QLabel("JS Runtime")
+        js_runtime_font = QFont()
+        js_runtime_font.setPointSize(14)
+        js_runtime_font.setBold(True)
+        js_runtime_label.setFont(js_runtime_font)
+        js_runtime_layout.addWidget(js_runtime_label)
+
+        self.js_runtime_version_label = QLabel("Checking runtime...")
+        self.js_runtime_version_label.setStyleSheet(f"color: {self.COLORS['text_secondary']}; font-style: italic;")
+        js_runtime_layout.addWidget(self.js_runtime_version_label)
+
+        js_runtime_layout.addSpacing(10)
+
+        js_runtime_info = QLabel(
+            'Used by yt-dlp for YouTube<br>'
+            'JavaScript extraction.<br><br>'
+            'Recommended: Deno or Node.js<br><br>'
+            'Docs: <a href="https://github.com/yt-dlp/yt-dlp/wiki/EJS">yt-dlp EJS wiki</a>'
+        )
+        js_runtime_info.setWordWrap(True)
+        js_runtime_info.setTextFormat(Qt.TextFormat.RichText)
+        js_runtime_info.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        js_runtime_info.setOpenExternalLinks(True)
+        js_runtime_layout.addWidget(js_runtime_info)
+        js_runtime_layout.addStretch()
+
+        powered_by_layout.addWidget(js_runtime_widget)
+
+        ytdlp_ejs_widget = QWidget()
+        ytdlp_ejs_layout = QVBoxLayout(ytdlp_ejs_widget)
+        ytdlp_ejs_layout.setContentsMargins(10, 0, 10, 0)
+
+        ytdlp_ejs_label = QLabel("yt-dlp-ejs")
+        ytdlp_ejs_font = QFont()
+        ytdlp_ejs_font.setPointSize(14)
+        ytdlp_ejs_font.setBold(True)
+        ytdlp_ejs_label.setFont(ytdlp_ejs_font)
+        ytdlp_ejs_layout.addWidget(ytdlp_ejs_label)
+
+        self.ytdlp_ejs_status_label = QLabel("Checking package...")
+        self.ytdlp_ejs_status_label.setStyleSheet(f"color: {self.COLORS['text_secondary']}; font-style: italic;")
+        ytdlp_ejs_layout.addWidget(self.ytdlp_ejs_status_label)
+
+        ytdlp_ejs_layout.addSpacing(10)
+
+        ytdlp_ejs_info = QLabel(
+            'Required for full YouTube support<br>'
+            'in this Python environment.<br><br>'
+            'Install separately if missing.<br><br>'
+            'Package: <a href="https://github.com/yt-dlp/ejs">yt-dlp/ejs</a>'
+        )
+        ytdlp_ejs_info.setWordWrap(True)
+        ytdlp_ejs_info.setTextFormat(Qt.TextFormat.RichText)
+        ytdlp_ejs_info.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        ytdlp_ejs_info.setOpenExternalLinks(True)
+        ytdlp_ejs_layout.addWidget(ytdlp_ejs_info)
+        ytdlp_ejs_layout.addStretch()
+
+        powered_by_layout.addWidget(ytdlp_ejs_widget)
 
         ffmpeg_widget = QWidget()
         ffmpeg_layout = QVBoxLayout(ffmpeg_widget)
@@ -1094,8 +1188,8 @@ class YtDlpGUI(QMainWindow):
             'GitHub: <a href="https://github.com/FFmpeg/FFmpeg">FFmpeg/FFmpeg</a>'
         )
         ffmpeg_info.setWordWrap(True)
-        ffmpeg_info.setTextFormat(Qt.RichText)
-        ffmpeg_info.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        ffmpeg_info.setTextFormat(Qt.TextFormat.RichText)
+        ffmpeg_info.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
         ffmpeg_info.setOpenExternalLinks(True)
         ffmpeg_layout.addWidget(ffmpeg_info)
         ffmpeg_layout.addStretch()
@@ -1110,8 +1204,8 @@ class YtDlpGUI(QMainWindow):
 
         layout.addSpacing(10)
 
-        footer_label = QLabel("© 2025 mme89")
-        footer_label.setAlignment(Qt.AlignCenter)
+        footer_label = QLabel("© 2025-2026 mme89")
+        footer_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         footer_label.setStyleSheet(f"color: {self.COLORS['text_secondary']}; margin-top: 20px;")
         layout.addWidget(footer_label)
 
@@ -1227,6 +1321,182 @@ class YtDlpGUI(QMainWindow):
             return os.path.expanduser(ytdlp_path)
         return self.find_executable("yt-dlp")
 
+    def find_available_executable(self, *names):
+        """Return the first available executable path from the provided names."""
+        for name in names:
+            path = shutil.which(name)
+            if path:
+                return path
+
+            detected_path = self.find_executable(name)
+            if detected_path != name:
+                return detected_path
+
+        return None
+
+    def get_custom_options_args(self):
+        """Parse custom yt-dlp options entered in the UI."""
+        custom_options = self.custom_options_input.text().strip()
+        if not custom_options:
+            return []
+
+        try:
+            return shlex.split(custom_options)
+        except ValueError:
+            return custom_options.split()
+
+    def detect_js_runtime(self):
+        """Detect the JS runtime yt-dlp will use."""
+        custom_args = self.get_custom_options_args()
+        for index, arg in enumerate(custom_args):
+            runtime_spec = None
+            if arg == "--js-runtimes" and index + 1 < len(custom_args):
+                runtime_spec = custom_args[index + 1]
+            elif arg.startswith("--js-runtimes="):
+                runtime_spec = arg.split("=", 1)[1]
+
+            if not runtime_spec:
+                continue
+
+            runtime_entry = runtime_spec.split(",", 1)[0]
+            runtime_name, _, runtime_path = runtime_entry.partition(":")
+            runtime_name = runtime_name.strip()
+            runtime_path = runtime_path.strip()
+
+            display_names = {
+                "deno": "Deno",
+                "node": "Node",
+                "nodejs": "Node",
+                "bun": "Bun",
+                "quickjs": "QuickJS",
+                "qjs": "QuickJS",
+            }
+            executable_names = {
+                "deno": ("deno",),
+                "node": ("node", "nodejs"),
+                "nodejs": ("node", "nodejs"),
+                "bun": ("bun",),
+                "quickjs": ("qjs",),
+                "qjs": ("qjs",),
+            }
+
+            if not runtime_path and runtime_name in executable_names:
+                runtime_path = self.find_available_executable(*executable_names[runtime_name]) or ""
+
+            return {
+                "source": "custom",
+                "name": display_names.get(runtime_name, runtime_name or "Custom"),
+                "path": runtime_path,
+                "spec": runtime_spec,
+            }
+
+        deno_path = shutil.which("deno")
+        if deno_path:
+            return {
+                "source": "auto",
+                "name": "Deno",
+                "path": deno_path,
+                "spec": "deno",
+            }
+
+        deno_path = self.find_available_executable("deno")
+        if deno_path:
+            return {
+                "source": "auto",
+                "name": "Deno",
+                "path": deno_path,
+                "spec": f"deno:{deno_path}",
+            }
+
+        runtime_candidates = (
+            ("Node", "node", ("node", "nodejs")),
+            ("Bun", "bun", ("bun",)),
+            ("QuickJS", "quickjs", ("qjs",)),
+        )
+        for display_name, runtime_name, executable_names in runtime_candidates:
+            runtime_path = self.find_available_executable(*executable_names)
+            if runtime_path:
+                return {
+                    "source": "auto",
+                    "name": display_name,
+                    "path": runtime_path,
+                    "spec": f"{runtime_name}:{runtime_path}",
+                }
+
+        return None
+
+    def get_js_runtime_args(self):
+        """Auto-enable a supported JS runtime for yt-dlp when one is available."""
+        runtime_info = self.detect_js_runtime()
+        if not runtime_info or runtime_info["source"] == "custom":
+            return []
+
+        if runtime_info["name"] == "Deno" and runtime_info["spec"] == "deno":
+            return []
+
+        return ["--js-runtimes", runtime_info["spec"]]
+
+    def get_executable_version(self, executable_path):
+        """Return the first line of `<path> --version`, if available."""
+        process = None
+        try:
+            process = QProcess()
+            process.start(executable_path, ["--version"])
+            process.waitForFinished(3000)
+
+            if process.exitCode() == 0:
+                output = bytes(process.readAllStandardOutput().data()).decode('utf-8', errors='replace').strip()
+                if output:
+                    return output.splitlines()[0]
+        except Exception:
+            return None
+        finally:
+            if process:
+                process.kill()
+                process.waitForFinished(500)
+                process.deleteLater()
+
+        return None
+
+    def check_js_runtime_version(self):
+        """Check which JS runtime yt-dlp will use and display its status."""
+        runtime_info = self.detect_js_runtime()
+
+        if not runtime_info:
+            self.js_runtime_version = "Not found"
+            self.js_runtime_version_label.setText("⚠️ No JS runtime found")
+            self.js_runtime_version_label.setStyleSheet(f"color: {self.COLORS['warning']}; font-style: italic;")
+            return
+
+        version_line = None
+        if runtime_info["path"]:
+            version_line = self.get_executable_version(runtime_info["path"])
+
+        if version_line:
+            self.js_runtime_version = version_line
+            prefix = "Configured" if runtime_info["source"] == "custom" else "Using"
+            self.js_runtime_version_label.setText(f"{prefix}: {runtime_info['name']} {version_line}")
+            self.js_runtime_version_label.setStyleSheet(f"color: {self.COLORS['success']}; font-weight: bold;")
+        elif runtime_info["source"] == "custom":
+            self.js_runtime_version = runtime_info["spec"]
+            self.js_runtime_version_label.setText(f"Configured: {runtime_info['spec']}")
+            self.js_runtime_version_label.setStyleSheet(f"color: {self.COLORS['info']}; font-weight: bold;")
+        else:
+            self.js_runtime_version = runtime_info["name"]
+            self.js_runtime_version_label.setText(f"Using: {runtime_info['name']}")
+            self.js_runtime_version_label.setStyleSheet(f"color: {self.COLORS['success']}; font-weight: bold;")
+
+    def check_ytdlp_ejs_status(self):
+        """Check whether yt-dlp-ejs is installed in the current Python environment."""
+        if importlib.util.find_spec("yt_dlp_ejs") is not None:
+            self.ytdlp_ejs_status = "Installed"
+            self.ytdlp_ejs_status_label.setText("Installed in Python environment")
+            self.ytdlp_ejs_status_label.setStyleSheet(f"color: {self.COLORS['success']}; font-weight: bold;")
+        else:
+            self.ytdlp_ejs_status = "Missing"
+            self.ytdlp_ejs_status_label.setText("⚠️ Missing from Python environment")
+            self.ytdlp_ejs_status_label.setStyleSheet(f"color: {self.COLORS['warning']}; font-style: italic;")
+
     def check_ytdlp_version(self):
         """Check if yt-dlp is installed and get version"""
         process = None
@@ -1237,7 +1507,7 @@ class YtDlpGUI(QMainWindow):
             process.waitForFinished(3000)
 
             if process.exitCode() == 0:
-                version = process.readAllStandardOutput().data().decode('utf-8').strip()
+                version = bytes(process.readAllStandardOutput().data()).decode('utf-8').strip()
                 self.ytdlp_version = version
                 self.ytdlp_version_label.setText(f"Installed version: {version}")
                 self.ytdlp_version_label.setStyleSheet(f"color: {self.COLORS['success']}; font-weight: bold;")
@@ -1300,7 +1570,7 @@ class YtDlpGUI(QMainWindow):
             process.waitForFinished(3000)
 
             if process.exitCode() == 0:
-                output = process.readAllStandardOutput().data().decode('utf-8')
+                output = bytes(process.readAllStandardOutput().data()).decode('utf-8')
                 first_line = output.split('\n')[0]
                 if 'version' in first_line:
                     version = first_line.split('version')[1].strip().split()[0]
@@ -1346,12 +1616,13 @@ class YtDlpGUI(QMainWindow):
         if self.terminal_window and self.terminal_window.isVisible():
             self.terminal_window.clear()
 
-        self.format_fetcher = FormatFetcher(url, self.get_ytdlp_path())
+        self.format_fetcher = FormatFetcher(url, self.get_ytdlp_path(), self.get_js_runtime_args())
         self.format_fetcher.finished.connect(self.on_formats_fetched)
         self.format_fetcher.error.connect(self.on_fetch_error)
 
         if self.terminal_window and self.terminal_window.isVisible():
-            self.format_fetcher.output.connect(lambda text: self.terminal_window.append(text))
+            terminal_window = self.terminal_window
+            self.format_fetcher.output.connect(lambda text: terminal_window.append(text))
 
         self.format_fetcher.start()
 
@@ -1419,7 +1690,7 @@ class YtDlpGUI(QMainWindow):
         has_subtitles = bool(self.subtitles or (self.automatic_captions and show_auto_captions))
 
         if has_subtitles:
-            self.subtitle_combo.addItem("All available", "all")
+            self.subtitle_combo.addItem("All subtitles", "all")
 
             if self.subtitles:
                 for lang_code in sorted(self.subtitles.keys()):
@@ -1431,6 +1702,8 @@ class YtDlpGUI(QMainWindow):
                         self.subtitle_combo.addItem(f"{lang_code} (auto)", lang_code)
         else:
             self.subtitle_combo.addItem("English (if available)", "en")
+
+        self.update_subtitle_option_states()
 
         title = data.get('title', 'Unknown')
         duration = data.get('duration', 0)
@@ -1528,7 +1801,7 @@ class YtDlpGUI(QMainWindow):
         has_subtitles = bool(self.subtitles or (self.automatic_captions and show_auto_captions))
 
         if has_subtitles:
-            self.subtitle_combo.addItem("All available", "all")
+            self.subtitle_combo.addItem("All subtitles", "all")
 
             if self.subtitles:
                 for lang_code in sorted(self.subtitles.keys()):
@@ -1546,6 +1819,36 @@ class YtDlpGUI(QMainWindow):
                 self.subtitle_combo.setCurrentIndex(i)
                 break
 
+        self.update_subtitle_option_states()
+
+    def update_subtitle_option_states(self):
+        """Update subtitle-related option states based on the current selection."""
+        subtitle_lang = self.subtitle_combo.currentData()
+        include_all_subtitles = subtitle_lang == "all"
+        self.include_live_chat_checkbox.setEnabled(include_all_subtitles)
+        self.keep_subtitle_files_checkbox.setEnabled(bool(subtitle_lang))
+
+    def get_all_subtitle_langs_value(self):
+        """Return the subtitle language selector for the 'all subtitles' option."""
+        if self.include_live_chat_checkbox.isChecked():
+            return "all"
+        return "all,-live_chat"
+
+    def add_subtitle_args(self, args):
+        """Append subtitle-related yt-dlp arguments based on the current UI state."""
+        subtitle_lang = self.subtitle_combo.currentData()
+        if not subtitle_lang:
+            return
+
+        args.append("--embed-subs")
+        if self.keep_subtitle_files_checkbox.isChecked():
+            args.append("--write-subs")
+
+        if subtitle_lang != "all":
+            args.extend(["--sub-langs", subtitle_lang])
+        else:
+            args.extend(["--sub-langs", self.get_all_subtitle_langs_value()])
+
     def load_thumbnail(self, url):
         """Load thumbnail using QtNetwork for better PyInstaller compatibility"""
         try:
@@ -1558,7 +1861,7 @@ class YtDlpGUI(QMainWindow):
     def on_thumbnail_loaded(self, reply):
         """Handle thumbnail download completion"""
         try:
-            if reply.error() == QNetworkReply.NoError:
+            if reply.error() == QNetworkReply.NetworkError.NoError:
                 image_data = reply.readAll()
                 pixmap = QPixmap()
                 if pixmap.loadFromData(image_data):
@@ -1654,13 +1957,7 @@ class YtDlpGUI(QMainWindow):
         if video_id == "none" and not manual_format:
             args.extend(["-x", "--audio-format", "mp3"])
 
-        subtitle_lang = self.subtitle_combo.currentData()
-        if subtitle_lang:
-            args.extend(["--write-subs", "--embed-subs"])
-            if subtitle_lang != "all":
-                args.extend(["--sub-lang", subtitle_lang])
-            else:
-                args.append("--all-subs")
+        self.add_subtitle_args(args)
 
         if "+" in format_id:
             args.extend(["--merge-output-format", "mp4"])
@@ -1774,13 +2071,7 @@ class YtDlpGUI(QMainWindow):
         if video_id == "none" and not manual_format:
             args.extend(["-x", "--audio-format", "mp3"])
 
-        subtitle_lang = self.subtitle_combo.currentData()
-        if subtitle_lang:
-            args.extend(["--write-subs", "--embed-subs"])
-            if subtitle_lang != "all":
-                args.extend(["--sub-lang", subtitle_lang])
-            else:
-                args.append("--all-subs")
+        self.add_subtitle_args(args)
 
         if "+" in format_id:
             args.extend(["--merge-output-format", "mp4"])
@@ -1810,11 +2101,11 @@ class YtDlpGUI(QMainWindow):
 
         for i, item in enumerate(self.download_queue):
             index_item = QTableWidgetItem(str(i + 1))
-            index_item.setTextAlignment(Qt.AlignCenter)
+            index_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.queue_table.setItem(i, 0, index_item)
 
             status_item = QTableWidgetItem(item["status"])
-            status_item.setTextAlignment(Qt.AlignCenter)
+            status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             if item["status"] == "Completed":
                 status_item.setForeground(QColor(self.COLORS['success']))
             elif item["status"] == "Failed":
@@ -1832,12 +2123,12 @@ class YtDlpGUI(QMainWindow):
 
             format_display = item.get("format_display", item["format"])
             format_item = QTableWidgetItem(format_display)
-            format_item.setTextAlignment(Qt.AlignCenter)
+            format_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.queue_table.setItem(i, 4, format_item)
 
             size_display = item.get("size", "Unknown")
             size_item = QTableWidgetItem(size_display)
-            size_item.setTextAlignment(Qt.AlignCenter)
+            size_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.queue_table.setItem(i, 5, size_item)
 
         if len(self.download_queue) == 0:
@@ -1945,7 +2236,8 @@ class YtDlpGUI(QMainWindow):
 
         self.download_thread = DownloadThread(args, url, self.get_ytdlp_path())
         if self.terminal_window and self.terminal_window.isVisible():
-            self.download_thread.output.connect(lambda text: self.terminal_window.append(text))
+            terminal_window = self.terminal_window
+            self.download_thread.output.connect(lambda text: terminal_window.append(text))
         self.download_thread.progress.connect(self.update_queue_progress)
         self.download_thread.finished_signal.connect(self.on_queue_download_finished)
         self.download_thread.start()
@@ -1983,10 +2275,10 @@ class YtDlpGUI(QMainWindow):
             self,
             "Stop Queue",
             "Stop processing the queue?\n\nThe current download will be aborted.",
-            QMessageBox.Yes | QMessageBox.No
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
 
-        if reply == QMessageBox.Yes:
+        if reply == QMessageBox.StandardButton.Yes:
             self.is_processing_queue = False
             self.start_queue_btn.setEnabled(True)
             self.stop_queue_btn.setEnabled(False)
@@ -2012,10 +2304,10 @@ class YtDlpGUI(QMainWindow):
             self,
             "Clear Queue",
             f"Remove all {len(self.download_queue)} items from the queue?",
-            QMessageBox.Yes | QMessageBox.No
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
 
-        if reply == QMessageBox.Yes:
+        if reply == QMessageBox.StandardButton.Yes:
             self.download_queue.clear()
             self.update_queue_table()
             self.start_queue_btn.setEnabled(False)
@@ -2037,10 +2329,10 @@ class YtDlpGUI(QMainWindow):
             self,
             "Remove Items",
             f"Remove {len(selected_rows)} selected item(s) from queue?",
-            QMessageBox.Yes | QMessageBox.No
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
 
-        if reply == QMessageBox.Yes:
+        if reply == QMessageBox.StandardButton.Yes:
             for row in sorted(selected_rows, reverse=True):
                 if row < len(self.download_queue):
                     del self.download_queue[row]
@@ -2065,12 +2357,13 @@ class YtDlpGUI(QMainWindow):
         self.list_playlist_btn.setEnabled(False)
         self.playlist_table.setRowCount(0)
 
-        self.playlist_fetcher = FormatFetcher(url, self.get_ytdlp_path())
+        self.playlist_fetcher = FormatFetcher(url, self.get_ytdlp_path(), self.get_js_runtime_args())
         self.playlist_fetcher.finished.connect(self.on_playlist_loaded)
         self.playlist_fetcher.error.connect(self.on_playlist_error)
 
         if self.terminal_window and self.terminal_window.isVisible():
-            self.playlist_fetcher.output.connect(lambda text: self.terminal_window.append(text))
+            terminal_window = self.terminal_window
+            self.playlist_fetcher.output.connect(lambda text: terminal_window.append(text))
 
         self.playlist_fetcher.start()
 
@@ -2087,12 +2380,12 @@ class YtDlpGUI(QMainWindow):
 
         for i, entry in enumerate(entries):
             checkbox_item = QTableWidgetItem()
-            checkbox_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
-            checkbox_item.setCheckState(Qt.Checked)
+            checkbox_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+            checkbox_item.setCheckState(Qt.CheckState.Checked)
             self.playlist_table.setItem(i, 0, checkbox_item)
 
             status_item = QTableWidgetItem("Pending")
-            status_item.setTextAlignment(Qt.AlignCenter)
+            status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             status_item.setForeground(QColor(self.COLORS['text_secondary']))
             self.playlist_table.setItem(i, 1, status_item)
 
@@ -2111,7 +2404,7 @@ class YtDlpGUI(QMainWindow):
             else:
                 duration_str = "Unknown"
             duration_item = QTableWidgetItem(duration_str)
-            duration_item.setTextAlignment(Qt.AlignCenter)
+            duration_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.playlist_table.setItem(i, 3, duration_item)
 
             uploader = entry.get('uploader', 'Unknown')
@@ -2139,7 +2432,7 @@ class YtDlpGUI(QMainWindow):
         checked_rows = []
         for row in range(self.playlist_table.rowCount()):
             checkbox_item = self.playlist_table.item(row, 0)
-            if checkbox_item and checkbox_item.checkState() == Qt.Checked:
+            if checkbox_item and checkbox_item.checkState() == Qt.CheckState.Checked:
                 checked_rows.append(row)
 
         if not checked_rows:
@@ -2172,14 +2465,14 @@ class YtDlpGUI(QMainWindow):
         for row in range(self.playlist_table.rowCount()):
             checkbox_item = self.playlist_table.item(row, 0)
             if checkbox_item:
-                checkbox_item.setCheckState(Qt.Checked)
+                checkbox_item.setCheckState(Qt.CheckState.Checked)
 
     def uncheck_all_playlist(self):
         """Uncheck all playlist items"""
         for row in range(self.playlist_table.rowCount()):
             checkbox_item = self.playlist_table.item(row, 0)
             if checkbox_item:
-                checkbox_item.setCheckState(Qt.Unchecked)
+                checkbox_item.setCheckState(Qt.CheckState.Unchecked)
 
     def execute_custom(self):
         url = self.url_input.text().strip()
@@ -2205,7 +2498,7 @@ class YtDlpGUI(QMainWindow):
             QMessageBox.warning(self, "Error", "Please enter a URL first!")
             return
 
-        self.run_yt_dlp(["--print-json"], self.advanced_output)
+        self.run_yt_dlp(["--print", "%()j"], self.advanced_output)
 
     def list_subtitles(self):
         url = self.url_input.text().strip()
@@ -2213,7 +2506,10 @@ class YtDlpGUI(QMainWindow):
             QMessageBox.warning(self, "Error", "Please enter a URL first!")
             return
 
-        self.run_yt_dlp(["--list-subs"], self.advanced_output)
+        self.run_yt_dlp(
+            ["--print", "automatic_captions_table", "--print", "subtitles_table"],
+            self.advanced_output,
+        )
 
     def run_yt_dlp(self, args, output_type, format_display=""):
         url = self.url_input.text().strip()
@@ -2231,9 +2527,12 @@ class YtDlpGUI(QMainWindow):
         if throttled_rate:
             args.extend(["--throttled-rate", throttled_rate])
 
+        js_runtime_args = self.get_js_runtime_args()
+        if js_runtime_args:
+            args = js_runtime_args + args
+
         custom_options = self.custom_options_input.text().strip()
         if custom_options:
-            import shlex
             try:
                 custom_args = shlex.split(custom_options)
                 args = custom_args + args
@@ -2309,10 +2608,10 @@ class YtDlpGUI(QMainWindow):
             self,
             "Abort Download",
             "Are you sure you want to abort the current download?",
-            QMessageBox.Yes | QMessageBox.No
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
 
-        if reply == QMessageBox.Yes:
+        if reply == QMessageBox.StandardButton.Yes:
             self.status_label.setText("Aborting download...")
             self.abort_btn.setEnabled(False)
 
