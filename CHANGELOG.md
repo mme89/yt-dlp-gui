@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.1] - 2026-04-12
+
+### Changed
+- Updated GitHub Actions workflow to Node 24-ready action versions
+- Disabled UPX and strip in the Windows PyInstaller build to avoid packaged Python DLL load failures
+
+### Fixed
+- Abort button now keeps a readable width during downloads, including on Windows with scaling
+- Hardened download/fetch shutdown cleanup to reduce abort-and-close crashes
+- Reduced Qt/PySide teardown issues by simplifying worker output handling and explicit app-exit cleanup
+
 ## [1.3.0] - 2026-04-12
 
 ### Added

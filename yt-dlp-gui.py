@@ -8,14 +8,16 @@ import os
 import sys
 import json
 import asyncio
+import gc
 import shutil
 import shlex
 import importlib.util
+import subprocess
 from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QComboBox, QTextEdit, QTabWidget,
-    QGroupBox, QCheckBox, QFileDialog, QMessageBox, QProgressBar,
+    QGroupBox, QCheckBox, QFileDialog, QMessageBox, QProgressBar, QSizePolicy,
     QTableWidget, QTableWidgetItem, QHeaderView
 )
 from PySide6.QtCore import Qt, QThread, Signal, QProcess, QByteArray, QUrl
@@ -82,6 +84,8 @@ class FormatFetcher(QThread):
         self.url = url
         self.ytdlp_path = ytdlp_path
         self.extra_args = extra_args or []
+        self.process = None
+        self.output_widget: object | None = None
 
     def run(self):
         try:
@@ -90,19 +94,25 @@ class FormatFetcher(QThread):
             self.output.emit(f"Running: {self.ytdlp_path} {' '.join(cmd_args)}\n")
             self.output.emit("-" * 60 + "\n")
 
-            process = QProcess()
-            process.start(self.ytdlp_path, cmd_args)
+            self.process = subprocess.Popen(
+                [self.ytdlp_path, *cmd_args],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+            )
 
             self.output.emit("Fetching video information...\n")
-            process.waitForFinished(-1)
+            stdout, stderr = self.process.communicate()
 
-            if process.exitCode() != 0:
-                error_output = bytes(process.readAllStandardError().data()).decode('utf-8', errors='replace')
+            if self.process.returncode != 0:
+                error_output = stderr or ""
                 self.output.emit(f"\nError output:\n{error_output}\n")
                 self.error.emit("Failed to fetch formats")
                 return
 
-            output = bytes(process.readAllStandardOutput().data()).decode('utf-8')
+            output = stdout or ""
             self.output.emit("Successfully retrieved video information!\n")
             self.output.emit("-" * 60 + "\n")
 
@@ -111,6 +121,21 @@ class FormatFetcher(QThread):
         except Exception as e:
             self.output.emit(f"\nException: {str(e)}\n")
             self.error.emit(str(e))
+        finally:
+            self.process = None
+
+    def stop(self, force=False):
+        """Stop the running yt-dlp metadata process."""
+        if self.process and self.process.poll() is None:
+            try:
+                self.process.terminate()
+                if force:
+                    try:
+                        self.process.wait(timeout=1.5)
+                    except subprocess.TimeoutExpired:
+                        self.process.kill()
+            except Exception:
+                pass
 
 class DownloadThread(QThread):
     """Thread for downloading without blocking UI"""
@@ -125,25 +150,36 @@ class DownloadThread(QThread):
         self.ytdlp_path = ytdlp_path
         self.process = None
         self._should_stop = False
+        self.output_widget: object | None = None
+        self.is_download = True
 
     def run(self):
-        self.process = QProcess()
-        self.process.readyReadStandardOutput.connect(self._handle_output)
-        self.process.readyReadStandardError.connect(self._handle_output)
-        self.process.finished.connect(self._handle_finished)
+        try:
+            self.process = subprocess.Popen(
+                [self.ytdlp_path, *self.args, self.url],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                bufsize=1,
+            )
 
-        self.process.start(self.ytdlp_path, self.args + [self.url])
-        self.process.waitForFinished(-1)
+            if self.process.stdout:
+                for line in self.process.stdout:
+                    if not line:
+                        continue
+                    self.output.emit(line)
+                    self._parse_progress(line)
 
-    def _handle_output(self):
-        if self.process:
-            output = bytes(self.process.readAllStandardOutput().data()).decode('utf-8', errors='replace')
-            if output:
-                self.output.emit(output)
-                self._parse_progress(output)
-            error = bytes(self.process.readAllStandardError().data()).decode('utf-8', errors='replace')
-            if error:
-                self.output.emit(error)
+            exit_code = self.process.wait()
+            if self._should_stop and exit_code != 0:
+                exit_code = -15
+            self.finished_signal.emit(exit_code)
+        finally:
+            if self.process and self.process.stdout:
+                self.process.stdout.close()
+            self.process = None
 
     def _parse_progress(self, text):
         """Parse yt-dlp output for progress information"""
@@ -182,16 +218,26 @@ class DownloadThread(QThread):
         elif '[EmbedSubtitle]' in text:
             self.progress.emit(100, "Embedding subtitles...")
 
-    def _handle_finished(self, exit_code):
-        self.finished_signal.emit(exit_code)
-
     def stop(self):
         """Request the download to stop"""
         self._should_stop = True
-        if self.process and self.process.state() == QProcess.ProcessState.Running:
+        if self.process and self.process.poll() is None:
             try:
                 self.process.terminate()
-            except:
+            except Exception:
+                pass
+
+    def stop_and_wait(self, timeout_ms=3000):
+        """Stop the download process and wait briefly before killing it."""
+        self._should_stop = True
+        if self.process and self.process.poll() is None:
+            try:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=timeout_ms / 1000)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+            except Exception:
                 pass
 
 class YtDlpGUI(QMainWindow):
@@ -226,6 +272,7 @@ class YtDlpGUI(QMainWindow):
         super().__init__()
         self.config_file = Path(__file__).parent / "settings.json"
         self.format_fetcher = None
+        self.playlist_fetcher = None
         self.download_thread = None
         self.video_formats = []
         self.audio_formats = []
@@ -240,7 +287,9 @@ class YtDlpGUI(QMainWindow):
         self.current_queue_item = None
         self.format_data = {}
         self.current_playlist_downloads = []
-        self.network_manager = QNetworkAccessManager()
+        self.network_manager = QNetworkAccessManager(self)
+        self.active_thumbnail_reply = None
+        self.is_closing = False
 
         self.init_ui()
         self.setup_logo()
@@ -514,7 +563,7 @@ class YtDlpGUI(QMainWindow):
             ))
 
     def init_ui(self):
-        self.setWindowTitle("mme89 yt-dlp GUI - v1.3.0")
+        self.setWindowTitle("mme89 yt-dlp GUI - v1.3.1")
         self.setFixedSize(1200, 900)
 
         central_widget = QWidget()
@@ -670,7 +719,6 @@ class YtDlpGUI(QMainWindow):
         self.abort_btn = QPushButton("Abort Download")
         self.abort_btn.clicked.connect(self.abort_download)
         self.abort_btn.setEnabled(False)
-        self.abort_btn.setFixedWidth(150)
         self.abort_btn.setStyleSheet(f"""
             QPushButton {{
                 background-color: {self.COLORS['error']};
@@ -690,6 +738,8 @@ class YtDlpGUI(QMainWindow):
                 background-color: {self.COLORS['text_disabled']};
             }}
         """)
+        self.abort_btn.setMinimumWidth(self.abort_btn.sizeHint().width() + 20)
+        self.abort_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         progress_layout.addWidget(self.abort_btn)
 
         progress_group.setLayout(progress_layout)
@@ -1020,7 +1070,7 @@ class YtDlpGUI(QMainWindow):
         app_title.setFont(app_title_font)
         version_layout.addWidget(app_title)
 
-        version_label = QLabel("Version 1.3.0")
+        version_label = QLabel("Version 1.3.1")
         version_label.setStyleSheet(f"color: {self.COLORS['text_secondary']};")
         version_layout.addWidget(version_label)
 
@@ -1226,6 +1276,8 @@ class YtDlpGUI(QMainWindow):
 
     def on_terminal_closed(self):
         """Handle terminal window being closed"""
+        if self.is_closing:
+            return
         self.show_terminal_checkbox.setChecked(False)
 
     def browse_destination(self):
@@ -1621,12 +1673,16 @@ class YtDlpGUI(QMainWindow):
         self.format_fetcher.error.connect(self.on_fetch_error)
 
         if self.terminal_window and self.terminal_window.isVisible():
-            terminal_window = self.terminal_window
-            self.format_fetcher.output.connect(lambda text: terminal_window.append(text))
+            self.format_fetcher.output_widget = self.terminal_window
+            self.format_fetcher.output.connect(self.append_thread_output)
 
         self.format_fetcher.start()
 
     def on_formats_fetched(self, data):
+        self.format_fetcher = None
+        if self.is_closing:
+            return
+
         formats = data.get('formats', [])
         self.subtitles = data.get('subtitles', {})
         self.automatic_captions = data.get('automatic_captions', {})
@@ -1783,6 +1839,10 @@ class YtDlpGUI(QMainWindow):
         self.analyze_btn.setEnabled(True)
 
     def on_fetch_error(self, error):
+        self.format_fetcher = None
+        if self.is_closing:
+            return
+
         QMessageBox.critical(self, "Error", f"Failed to fetch formats: {error}")
         self.download_page_status_label.setText("Error fetching formats")
         self.analyze_btn.setEnabled(True)
@@ -1852,15 +1912,25 @@ class YtDlpGUI(QMainWindow):
     def load_thumbnail(self, url):
         """Load thumbnail using QtNetwork for better PyInstaller compatibility"""
         try:
+            if self.active_thumbnail_reply:
+                self.active_thumbnail_reply.abort()
+                self.active_thumbnail_reply.deleteLater()
+                self.active_thumbnail_reply = None
             request = QNetworkRequest(QUrl(url))
-            reply = self.network_manager.get(request)
-            reply.finished.connect(lambda: self.on_thumbnail_loaded(reply))
+            self.active_thumbnail_reply = self.network_manager.get(request)
+            self.active_thumbnail_reply.finished.connect(self.on_thumbnail_loaded)
         except Exception as e:
             self.thumbnail_label.setText("Failed to load thumbnail")
 
-    def on_thumbnail_loaded(self, reply):
+    def on_thumbnail_loaded(self):
         """Handle thumbnail download completion"""
+        reply = self.active_thumbnail_reply
+        if not reply:
+            return
+
         try:
+            if self.is_closing:
+                return
             if reply.error() == QNetworkReply.NetworkError.NoError:
                 image_data = reply.readAll()
                 pixmap = QPixmap()
@@ -1876,7 +1946,25 @@ class YtDlpGUI(QMainWindow):
             print(f"Exception loading thumbnail: {e}")
             self.thumbnail_label.setText("Failed to load thumbnail")
         finally:
+            if reply == self.active_thumbnail_reply:
+                self.active_thumbnail_reply = None
             reply.deleteLater()
+
+    def append_thread_output(self, text):
+        """Append worker output to the widget attached to the sending thread."""
+        if self.is_closing:
+            return
+
+        sender = self.sender()
+        output_widget = getattr(sender, "output_widget", None)
+        if output_widget:
+            output_widget.append(text)
+
+    def on_download_thread_finished(self, exit_code):
+        """Dispatch normal download completion based on the sending thread."""
+        thread = self.sender()
+        is_download = getattr(thread, "is_download", True)
+        self.on_download_finished(exit_code, is_download)
 
     def download_video(self):
         url = self.url_input.text().strip()
@@ -2236,8 +2324,8 @@ class YtDlpGUI(QMainWindow):
 
         self.download_thread = DownloadThread(args, url, self.get_ytdlp_path())
         if self.terminal_window and self.terminal_window.isVisible():
-            terminal_window = self.terminal_window
-            self.download_thread.output.connect(lambda text: terminal_window.append(text))
+            self.download_thread.output_widget = self.terminal_window
+            self.download_thread.output.connect(self.append_thread_output)
         self.download_thread.progress.connect(self.update_queue_progress)
         self.download_thread.finished_signal.connect(self.on_queue_download_finished)
         self.download_thread.start()
@@ -2249,6 +2337,10 @@ class YtDlpGUI(QMainWindow):
 
     def on_queue_download_finished(self, exit_code):
         """Handle completion of queue item download"""
+        self.download_thread = None
+        if self.is_closing:
+            return
+
         was_aborted = (exit_code == 15 or exit_code == -15)
 
         if self.current_queue_item:
@@ -2362,13 +2454,17 @@ class YtDlpGUI(QMainWindow):
         self.playlist_fetcher.error.connect(self.on_playlist_error)
 
         if self.terminal_window and self.terminal_window.isVisible():
-            terminal_window = self.terminal_window
-            self.playlist_fetcher.output.connect(lambda text: terminal_window.append(text))
+            self.playlist_fetcher.output_widget = self.terminal_window
+            self.playlist_fetcher.output.connect(self.append_thread_output)
 
         self.playlist_fetcher.start()
 
     def on_playlist_loaded(self, data):
         """Populate table with playlist items"""
+        self.playlist_fetcher = None
+        if self.is_closing:
+            return
+
         entries = data.get('entries', [])
 
         if not entries:
@@ -2418,6 +2514,10 @@ class YtDlpGUI(QMainWindow):
 
     def on_playlist_error(self, error):
         """Handle playlist loading error"""
+        self.playlist_fetcher = None
+        if self.is_closing:
+            return
+
         self.playlist_status_label.setText(f"Error: {error}")
         self.list_playlist_btn.setEnabled(True)
         QMessageBox.critical(self, "Error", f"Failed to load playlist: {error}")
@@ -2587,11 +2687,13 @@ class YtDlpGUI(QMainWindow):
             self.abort_btn.setEnabled(True)
 
         self.download_thread = DownloadThread(args, url, self.get_ytdlp_path())
+        self.download_thread.is_download = is_download
+        self.download_thread.output_widget = output_widget
         if output_widget:
-            self.download_thread.output.connect(lambda text: output_widget.append(text))
+            self.download_thread.output.connect(self.append_thread_output)
         if is_download:
             self.download_thread.progress.connect(self.update_progress)
-        self.download_thread.finished_signal.connect(lambda code: self.on_download_finished(code, is_download))
+        self.download_thread.finished_signal.connect(self.on_download_thread_finished)
         self.download_thread.start()
 
     def update_progress(self, percentage, status):
@@ -2618,6 +2720,10 @@ class YtDlpGUI(QMainWindow):
             self.download_thread.stop()
 
     def on_download_finished(self, exit_code, is_download):
+        self.download_thread = None
+        if self.is_closing:
+            return
+
         was_aborted = (exit_code == 15 or exit_code == -15)
 
         if self.terminal_window and self.terminal_window.isVisible():
@@ -2666,20 +2772,65 @@ class YtDlpGUI(QMainWindow):
 
         self.download_btn.setEnabled(True)
 
-    def closeEvent(self, event):
-        """Handle application close - cleanup running processes"""
-        if self.download_thread and self.download_thread.isRunning():
-            self.download_thread.stop()
-            self.download_thread.wait(1000)
-            if self.download_thread.isRunning():
-                self.download_thread.terminate()
+    def stop_worker_thread(self, thread, timeout_ms=3000):
+        """Stop a worker thread without using QThread.terminate()."""
+        if not thread or not thread.isRunning():
+            return True
 
-        if self.format_fetcher and self.format_fetcher.isRunning():
-            self.format_fetcher.terminate()
-            self.format_fetcher.wait(500)
+        if hasattr(thread, "stop_and_wait"):
+            thread.stop_and_wait(timeout_ms)
+        elif hasattr(thread, "stop"):
+            thread.stop(force=True)
+
+        return thread.wait(timeout_ms)
+
+    def cleanup_for_exit(self, interactive=True):
+        """Tear down background activity and Qt objects before interpreter shutdown."""
+        self.is_closing = True
+
+        if self.active_thumbnail_reply:
+            try:
+                self.active_thumbnail_reply.abort()
+                self.active_thumbnail_reply.finished.disconnect(self.on_thumbnail_loaded)
+            except Exception:
+                pass
+            self.active_thumbnail_reply.deleteLater()
+            self.active_thumbnail_reply = None
+
+        download_stopped = self.stop_worker_thread(self.download_thread)
+        format_fetcher_stopped = self.stop_worker_thread(self.format_fetcher)
+        playlist_fetcher_stopped = self.stop_worker_thread(self.playlist_fetcher)
+
+        if not download_stopped or not format_fetcher_stopped or not playlist_fetcher_stopped:
+            if interactive:
+                self.is_closing = False
+                QMessageBox.warning(
+                    self,
+                    "Please Wait",
+                    "A background task is still shutting down. Please wait a moment and try closing the app again.",
+                )
+            return False
+
+        self.download_thread = None
+        self.format_fetcher = None
+        self.playlist_fetcher = None
 
         if self.terminal_window:
+            try:
+                self.terminal_window.closed.disconnect(self.on_terminal_closed)
+            except Exception:
+                pass
             self.terminal_window.close()
+            self.terminal_window.deleteLater()
+            self.terminal_window = None
+
+        return True
+
+    def closeEvent(self, event):
+        """Handle application close - cleanup running processes"""
+        if not self.cleanup_for_exit(interactive=True):
+            event.ignore()
+            return
 
         event.accept()
 
@@ -2722,8 +2873,25 @@ def main():
     app.setApplicationName("yt-dlp GUI")
     app.setOrganizationName("mme89")
     window = YtDlpGUI()
+
+    def cleanup_window_on_quit():
+        if window is not None:
+            window.cleanup_for_exit(interactive=False)
+
+    app.aboutToQuit.connect(cleanup_window_on_quit)
     window.show()
-    sys.exit(app.exec())
+    exit_code = app.exec()
+
+    try:
+        window.cleanup_for_exit(interactive=False)
+        window.deleteLater()
+        app.processEvents()
+    except Exception:
+        pass
+
+    window = None
+    gc.collect()
+    sys.exit(exit_code)
 
 if __name__ == "__main__":
     main()
