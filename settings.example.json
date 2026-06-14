@@ -4,5 +4,6 @@
   "ffmpeg_path": "",
   "custom_options": "",
   "limit_rate": "",
-  "throttled_rate": ""
+  "throttled_rate": "",
+  "show_auto_captions": false
 }

@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.4.0] - 2026-06-14
+
+### Added
+- Added a shared `yt_dlp_gui/version.py` version source used by the app, build specs, and release validation
+- Added Windows executable version metadata generated from the shared app version
+- Added pinned release-build constraints for more reproducible GitHub Actions builds
+- Added GitHub Actions validation to ensure release tags match the app version
+- Added prerelease detection for alpha, beta, rc, preview, and pre release tags
+
+### Changed
+- Refactored the monolithic launcher into an importable `yt_dlp_gui` package with separate app, command, worker, terminal, process, and version modules
+- Packaged builds now store settings in the platform user config directory instead of writing inside the bundled app or PyInstaller extraction directory
+- Hardened release builds with read-only default workflow permissions, per-ref concurrency, 30-minute job timeouts, and an arm64 macOS runner
+- macOS package metadata now reads the shared app version and advertises macOS 13.0 or newer
+- Disabled UPX compression for macOS and Linux PyInstaller builds for better packaged-app reliability
+- Added `PySide6.QtNetwork` to all PyInstaller hidden-import lists for build-spec parity
+- Cleaned Linux build spec options by removing Windows-only Analysis settings
+
+### Fixed
+- Prevented Windows console windows from appearing when the GUI runs `yt-dlp`, `ffmpeg`, or related subprocess checks
+- Migrated legacy `settings.json` data into the persistent app config location for packaged builds
+- Updated the sample settings file to include the auto-captions setting
+
 ## [1.3.1] - 2026-04-12
 
 ### Changed

@@ -1,6 +1,30 @@
 # -*- mode: python ; coding: utf-8 -*-
 # PyInstaller spec file for macOS build
 
+import ast
+from pathlib import Path
+
+
+def read_app_version():
+    """Read APP_VERSION from the lightweight version module without importing PySide6."""
+    try:
+        spec_dir = Path(SPEC).resolve().parent
+    except NameError:
+        spec_dir = Path(__file__).resolve().parent
+
+    version_file = spec_dir.parent / 'yt_dlp_gui' / 'version.py'
+    module = ast.parse(version_file.read_text(encoding='utf-8'))
+    for node in module.body:
+        if (
+            isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == 'APP_VERSION' for target in node.targets)
+        ):
+            return ast.literal_eval(node.value)
+
+    raise RuntimeError(f"APP_VERSION not found in {version_file}")
+
+
+APP_VERSION = read_app_version()
 block_cipher = None
 
 a = Analysis(
@@ -8,7 +32,12 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[('../assets', 'assets')],
-    hiddenimports=['PySide6.QtCore', 'PySide6.QtGui', 'PySide6.QtWidgets'],
+    hiddenimports=[
+        'PySide6.QtCore',
+        'PySide6.QtGui',
+        'PySide6.QtWidgets',
+        'PySide6.QtNetwork',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -71,7 +100,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=True,
-    upx=True,
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -86,7 +115,7 @@ coll = COLLECT(
     a.zipfiles,
     a.datas,
     strip=True,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name='yt-dlp-gui',
 )
@@ -96,13 +125,13 @@ app = BUNDLE(
     name='yt-dlp-gui.app',
     icon='../assets/logo.png',
     bundle_identifier='com.mme89.yt-dlp-gui',
-    version='1.3.1',
+    version=APP_VERSION,
     info_plist={
         'CFBundleName': 'yt-dlp GUI',
         'CFBundleDisplayName': 'yt-dlp GUI',
-        'CFBundleShortVersionString': '1.3.1',
-        'CFBundleVersion': '1.3.1',
+        'CFBundleShortVersionString': APP_VERSION,
+        'CFBundleVersion': APP_VERSION,
         'NSHighResolutionCapable': 'True',
-        'LSMinimumSystemVersion': '10.13.0',
+        'LSMinimumSystemVersion': '13.0.0',
     },
 )

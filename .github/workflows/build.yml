@@ -1,4 +1,5 @@
 name: Build and Release
+run-name: Build ${{ github.ref_name }} by @${{ github.actor }}
 
 on:
   push:
@@ -7,11 +8,63 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
+  validate-version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Verify tag matches app version
+        shell: bash
+        run: |
+          app_version=$(python - <<'PY'
+          import ast
+          from pathlib import Path
+
+          module = ast.parse(Path("yt_dlp_gui/version.py").read_text(encoding="utf-8"))
+          for node in module.body:
+              if (
+                  isinstance(node, ast.Assign)
+                  and any(
+                      isinstance(target, ast.Name) and target.id == "APP_VERSION"
+                      for target in node.targets
+                  )
+              ):
+                  print(ast.literal_eval(node.value))
+                  break
+          else:
+              raise SystemExit("APP_VERSION not found in yt_dlp_gui/version.py")
+          PY
+          )
+
+          echo "App version: ${app_version}"
+
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            tag_version="${GITHUB_REF#refs/tags/v}"
+            echo "Tag version: ${tag_version}"
+
+            if [[ "${tag_version}" != "${app_version}" ]]; then
+              echo "::error::Tag version ${tag_version} does not match APP_VERSION ${app_version}"
+              exit 1
+            fi
+          else
+            echo "No tag detected; skipping version match check."
+          fi
+
   build-windows:
+    needs: validate-version
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
 
@@ -32,9 +85,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
+          python -m pip install --upgrade pip==26.1.2
+          pip install -r requirements.txt -c constraints-build.txt
+          pip install pyinstaller -c constraints-build.txt
 
       - name: Build Windows executable
         run: |
@@ -51,7 +104,12 @@ jobs:
           path: yt-dlp-gui-${{ steps.get_version.outputs.version }}-windows.zip
 
   build-macos:
-    runs-on: macos-latest
+    needs: validate-version
+    runs-on: macos-15-arm64
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v6
 
@@ -71,9 +129,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
+          python -m pip install --upgrade pip==26.1.2
+          pip install -r requirements.txt -c constraints-build.txt
+          pip install pyinstaller -c constraints-build.txt
 
       - name: Build macOS app
         run: |
@@ -115,7 +173,12 @@ jobs:
           path: yt-dlp-gui-${{ steps.get_version.outputs.version }}-mac.zip
 
   build-linux:
+    needs: validate-version
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v6
 
@@ -135,9 +198,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
+          python -m pip install --upgrade pip==26.1.2
+          pip install -r requirements.txt -c constraints-build.txt
+          pip install pyinstaller -c constraints-build.txt
 
       - name: Build Linux executable
         run: |
@@ -159,6 +222,12 @@ jobs:
     needs: [build-windows, build-macos, build-linux]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v6
 
@@ -172,6 +241,17 @@ jobs:
           # Extract content between first ## and second ## (latest version only)
           awk '/^## \[/{if(++count==2) exit; if(count==1) flag=1; next} flag' CHANGELOG.md > release_notes.md
 
+      - name: Detect prerelease tag
+        id: release_metadata
+        shell: bash
+        run: |
+          tag_name="${GITHUB_REF#refs/tags/}"
+          if [[ "${tag_name}" =~ -([Aa]lpha|[Bb]eta|[Rr][Cc]|[Pp]review|[Pp]re) ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
@@ -180,7 +260,7 @@ jobs:
             artifacts/yt-dlp-gui-macos/yt-dlp-gui-*-mac.zip
             artifacts/yt-dlp-gui-linux/yt-dlp-gui-*-linux.tar.gz
           draft: false
-          prerelease: false
+          prerelease: ${{ steps.release_metadata.outputs.prerelease }}
           body_path: release_notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
