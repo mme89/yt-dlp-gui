@@ -105,7 +105,7 @@ jobs:
 
   build-macos:
     needs: validate-version
-    runs-on: macos-15-arm64
+    runs-on: macos-15
     timeout-minutes: 30
     defaults:
       run:
