@@ -41,6 +41,23 @@ A modern, cross-platform GUI wrapper for [yt-dlp](https://github.com/yt-dlp/yt-d
 
 This application requires [yt-dlp](https://github.com/yt-dlp/yt-dlp) and [FFmpeg](https://github.com/FFmpeg/FFmpeg) to be installed on your system.
 
+- Use **yt-dlp 2026.10.26 or newer** for the latest bundled dependency security fixes. The GUI uses your separately installed yt-dlp; updating the GUI does not update yt-dlp.
+- Python installations of current yt-dlp require **Python 3.11+**. Official Windows yt-dlp binaries require **Windows 10 or newer**. Pre-built GUI applications do not require a separate Python installation.
+- Full YouTube support also requires EJS challenge solver scripts and a supported JavaScript runtime. Prefer **Deno 2.3+** or **Node.js 22+**. QuickJS 2023-12-09+ and all QuickJS-NG versions are supported. Bun is deprecated and supported only from 1.2.11 through 1.3.14.
+
+The GUI automatically selects a supported runtime in this order: Deno, Node.js, QuickJS, then Bun. Unsupported or unrecognized versions are skipped. Explicit `--js-runtimes` and `--no-js-runtimes` custom options take precedence.
+
+Official yt-dlp binaries already bundle EJS. For pip installations, install or upgrade yt-dlp and its default dependencies in the Python environment that runs yt-dlp:
+
+```bash
+python -m pip install -U "yt-dlp[default]"
+```
+
+For package-manager installations, upgrade through that package manager and check whether it includes EJS. The About tab does not verify EJS in the external yt-dlp installation; installing EJS into the GUI's Python environment alone may have no effect.
+
+See the [yt-dlp EJS setup guide](https://github.com/yt-dlp/yt-dlp/wiki/EJS) and [2026.10.26 release notes](https://github.com/yt-dlp/yt-dlp/releases/tag/2026.10.26). If you suspect interception of your network traffic, upstream recommends manually replacing older official executables instead of using their self-updater.
+
+
 ## Installation
 
 ### Option 1: Download Pre-built Application (Recommended)
@@ -59,7 +76,7 @@ git clone https://github.com/mme89/yt-dlp-gui.git
 cd yt-dlp-gui
 ```
 
-2. Install Python dependencies:
+2. With Python 3.11 or newer, install the GUI dependencies (yt-dlp and FFmpeg must also be installed as described above):
 ```bash
 pip install -r requirements.txt
 ```

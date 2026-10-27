@@ -12,7 +12,6 @@ import json
 import re
 import shutil
 import shlex
-import importlib.util
 import subprocess
 from pathlib import Path
 from PySide6.QtWidgets import (
@@ -26,6 +25,7 @@ from PySide6.QtGui import QFont, QPixmap, QColor, QIcon, QRegularExpressionValid
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
 
 from .commands import CommandMixin
+from .compatibility import RECOMMENDED_YTDLP_VERSION, is_supported_runtime, needs_ytdlp_update
 from .process_utils import hidden_subprocess_kwargs
 from .terminal_window import TerminalWindow
 from .version import APP_VERSION
@@ -1001,6 +1001,9 @@ class YtDlpGUI(CommandMixin, QMainWindow):
             'Core download engine.<br>'
             'Feature-rich command-line<br>'
             'audio/video downloader.<br><br>'
+            f'Recommended: yt-dlp {RECOMMENDED_YTDLP_VERSION} or newer.<br>'
+            'Python installs require Python 3.11+.<br>'
+            'Windows binaries require Windows 10+.<br><br>'
             'GitHub: <a href="https://github.com/yt-dlp/yt-dlp">yt-dlp/yt-dlp</a>'
         )
         ytdlp_info.setWordWrap(True)
@@ -1036,7 +1039,9 @@ class YtDlpGUI(CommandMixin, QMainWindow):
         js_runtime_info = QLabel(
             'Used by yt-dlp for YouTube<br>'
             'JavaScript extraction.<br><br>'
-            'Recommended: Deno or Node.js<br><br>'
+            'Recommended: Deno 2.3+ or Node.js 22+.<br>'
+            'QuickJS is also supported.<br>'
+            'Bun is deprecated (1.2.11–1.3.14 only).<br><br>'
             'Docs: <a href="https://github.com/yt-dlp/yt-dlp/wiki/EJS">yt-dlp EJS wiki</a>'
         )
         js_runtime_info.setWordWrap(True)
@@ -1070,9 +1075,11 @@ class YtDlpGUI(CommandMixin, QMainWindow):
         ytdlp_ejs_layout.addSpacing(10)
 
         ytdlp_ejs_info = QLabel(
-            'Required for full YouTube support<br>'
-            'in this Python environment.<br><br>'
-            'Install separately if missing.<br><br>'
+            'Required by yt-dlp for full YouTube support.<br><br>'
+            'Included in official yt-dlp binaries.<br>'
+            'For pip installs, use:<br>'
+            '<code>pip install -U &quot;yt-dlp[default]&quot;</code><br>'
+            'Run this in the environment containing yt-dlp.<br><br>'
             'Package: <a href="https://github.com/yt-dlp/ejs">yt-dlp/ejs</a>'
         )
         ytdlp_ejs_info.setWordWrap(True)
@@ -1297,6 +1304,13 @@ class YtDlpGUI(CommandMixin, QMainWindow):
     def _detect_js_runtime(self):
         """Detect the JS runtime yt-dlp will use."""
         custom_args = self.get_custom_options_args()
+        if "--no-js-runtimes" in custom_args:
+            return {
+                "source": "custom",
+                "name": "Custom runtime configuration",
+                "path": "",
+                "spec": "See custom options",
+            }
         for index, arg in enumerate(custom_args):
             runtime_spec = None
             if arg == "--js-runtimes" and index + 1 < len(custom_args):
@@ -1339,37 +1353,24 @@ class YtDlpGUI(CommandMixin, QMainWindow):
                 "spec": runtime_spec,
             }
 
-        deno_path = shutil.which("deno")
-        if deno_path:
-            return {
-                "source": "auto",
-                "name": "Deno",
-                "path": deno_path,
-                "spec": "deno",
-            }
-
-        deno_path = self.find_available_executable("deno")
-        if deno_path:
-            return {
-                "source": "auto",
-                "name": "Deno",
-                "path": deno_path,
-                "spec": f"deno:{deno_path}",
-            }
-
         runtime_candidates = (
+            ("Deno", "deno", ("deno",)),
             ("Node", "node", ("node", "nodejs")),
-            ("Bun", "bun", ("bun",)),
             ("QuickJS", "quickjs", ("qjs",)),
+            ("Bun", "bun", ("bun",)),
         )
         for display_name, runtime_name, executable_names in runtime_candidates:
             runtime_path = self.find_available_executable(*executable_names)
-            if runtime_path:
+            if not runtime_path:
+                continue
+            version_line = self.get_runtime_version(display_name, runtime_path)
+            if is_supported_runtime(display_name, version_line):
                 return {
                     "source": "auto",
                     "name": display_name,
                     "path": runtime_path,
                     "spec": f"{runtime_name}:{runtime_path}",
+                    "version": version_line,
                 }
 
         return None
@@ -1380,55 +1381,45 @@ class YtDlpGUI(CommandMixin, QMainWindow):
         if not runtime_info or runtime_info["source"] == "custom":
             return []
 
-        if runtime_info["name"] == "Deno" and runtime_info["spec"] == "deno":
-            return []
-
         return ["--js-runtimes", runtime_info["spec"]]
 
-    def get_executable_version(self, executable_path):
-        """Return the first line of `<path> --version`, if available."""
-        if sys.platform == 'win32':
-            try:
-                result = subprocess.run(
-                    [executable_path, "--version"],
-                    capture_output=True,
-                    text=True,
-                    encoding='utf-8',
-                    errors='replace',
-                    check=False,
-                    timeout=3,
-                    **hidden_subprocess_kwargs(),
-                )
-            except (OSError, subprocess.SubprocessError, ValueError):
-                return None
-
-            if result.returncode == 0:
-                output = (result.stdout or "").strip()
-                if output:
-                    return output.splitlines()[0]
-            return None
-
-        process = None
+    def get_executable_version(self, executable_path, version_args=("--version",), success_codes=(0,)):
+        """Return the first line of version output, with a bounded timeout."""
         try:
-            process = QProcess()
-            process.start(executable_path, ["--version"])
-            process.waitForFinished(3000)
-
-            if process.exitCode() == 0:
-                output = bytes(process.readAllStandardOutput().data()).decode(
-                    'utf-8', errors='replace'
-                ).strip()
-                if output:
-                    return output.splitlines()[0]
-        except (OSError, RuntimeError, ValueError):
+            result = subprocess.run(
+                [executable_path, *version_args],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=3,
+                **hidden_subprocess_kwargs(),
+            )
+        except (OSError, subprocess.SubprocessError, ValueError):
             return None
-        finally:
-            if process:
-                process.kill()
-                process.waitForFinished(500)
-                process.deleteLater()
 
+        if result.returncode in success_codes:
+            output = (result.stdout or result.stderr or "").strip()
+            if output:
+                return output.splitlines()[0]
         return None
+
+    def get_runtime_version(self, runtime_name, runtime_path):
+        """QuickJS reports its version in help output rather than --version."""
+        if os.path.isdir(runtime_path):
+            executable_name = {
+                "Deno": "deno", "Node": "node", "QuickJS": "qjs", "Bun": "bun",
+            }.get(runtime_name)
+            if not executable_name:
+                return None
+            if sys.platform == "win32":
+                executable_name += ".exe"
+            runtime_path = os.path.join(runtime_path, executable_name)
+        version_args = ("--help",) if runtime_name == "QuickJS" else ("--version",)
+        # QuickJS's help command returns 1 even when it prints valid version output.
+        success_codes = (0, 1) if runtime_name == "QuickJS" else (0,)
+        return self.get_executable_version(runtime_path, version_args, success_codes)
 
     def check_js_runtime_version(self):
         """Check which JS runtime yt-dlp will use and display its status."""
@@ -1436,28 +1427,38 @@ class YtDlpGUI(CommandMixin, QMainWindow):
 
         if not runtime_info:
             self.js_runtime_version = "Not found"
-            self.js_runtime_version_label.setText("⚠️ No JS runtime found")
+            self.js_runtime_version_label.setText(
+                "⚠️ No supported JS runtime found (Deno 2.3+ or Node.js 22+ recommended)"
+            )
             self.js_runtime_version_label.setStyleSheet(
                 f"color: {self.COLORS['warning']}; font-style: italic;"
             )
             return
 
-        version_line = None
-        if runtime_info["path"]:
-            version_line = self.get_executable_version(runtime_info["path"])
+        version_line = runtime_info.get("version")
+        if version_line is None and runtime_info["path"]:
+            version_line = self.get_runtime_version(runtime_info["name"], runtime_info["path"])
 
-        if version_line:
+        if version_line and not is_supported_runtime(runtime_info["name"], version_line):
+            self.js_runtime_version = version_line
+            self.js_runtime_version_label.setText(
+                f"⚠️ Unsupported or unrecognized: {runtime_info['name']} {version_line}"
+            )
+            self.js_runtime_version_label.setStyleSheet(
+                f"color: {self.COLORS['warning']}; font-weight: bold;"
+            )
+        elif version_line:
             self.js_runtime_version = version_line
             prefix = "Configured" if runtime_info["source"] == "custom" else "Using"
             self.js_runtime_version_label.setText(
                 f"{prefix}: {runtime_info['name']} {version_line}"
+                + (" (deprecated)" if runtime_info["name"] == "Bun" else "")
             )
-            self.js_runtime_version_label.setStyleSheet(
-                f"color: {self.COLORS['success']}; font-weight: bold;"
-            )
+            color = self.COLORS['warning' if runtime_info['name'] == 'Bun' else 'success']
+            self.js_runtime_version_label.setStyleSheet(f"color: {color}; font-weight: bold;")
         elif runtime_info["source"] == "custom":
             self.js_runtime_version = runtime_info["spec"]
-            self.js_runtime_version_label.setText(f"Configured: {runtime_info['spec']}")
+            self.js_runtime_version_label.setText(f"Configured (not verified): {runtime_info['spec']}")
             self.js_runtime_version_label.setStyleSheet(
                 f"color: {self.COLORS['info']}; font-weight: bold;"
             )
@@ -1469,19 +1470,12 @@ class YtDlpGUI(CommandMixin, QMainWindow):
             )
 
     def check_ytdlp_ejs_status(self):
-        """Check whether yt-dlp-ejs is installed in the current Python environment."""
-        if importlib.util.find_spec("yt_dlp_ejs") is not None:
-            self.ytdlp_ejs_status = "Installed"
-            self.ytdlp_ejs_status_label.setText("Installed in Python environment")
-            self.ytdlp_ejs_status_label.setStyleSheet(
-                f"color: {self.COLORS['success']}; font-weight: bold;"
-            )
-        else:
-            self.ytdlp_ejs_status = "Missing"
-            self.ytdlp_ejs_status_label.setText("⚠️ Missing from Python environment")
-            self.ytdlp_ejs_status_label.setStyleSheet(
-                f"color: {self.COLORS['warning']}; font-style: italic;"
-            )
+        """The GUI's Python packages do not describe the external yt-dlp install."""
+        self.ytdlp_ejs_status = "Not verified"
+        self.ytdlp_ejs_status_label.setText("Managed by your yt-dlp installation (not verified)")
+        self.ytdlp_ejs_status_label.setStyleSheet(
+            f"color: {self.COLORS['info']}; font-weight: bold;"
+        )
 
     def check_ytdlp_version(self):
         """Check if yt-dlp is installed and get version"""
@@ -1511,10 +1505,14 @@ class YtDlpGUI(CommandMixin, QMainWindow):
             if exit_code == 0:
                 version = stdout.strip()
                 self.ytdlp_version = version
-                self.ytdlp_version_label.setText(f"Installed version: {version}")
-                self.ytdlp_version_label.setStyleSheet(
-                    f"color: {self.COLORS['success']}; font-weight: bold;"
+                update_recommended = needs_ytdlp_update(version)
+                self.ytdlp_version_label.setText(
+                    f"Installed version: {version}"
+                    + (f" — update to {RECOMMENDED_YTDLP_VERSION}+ recommended"
+                       if update_recommended else "")
                 )
+                color = self.COLORS['warning' if update_recommended else 'success']
+                self.ytdlp_version_label.setStyleSheet(f"color: {color}; font-weight: bold;")
                 self.statusBar().showMessage(f"yt-dlp {version} detected", 3000)
             else:
                 self.ytdlp_version = "Not found"
@@ -1542,7 +1540,7 @@ class YtDlpGUI(CommandMixin, QMainWindow):
                     install_msg = (
                         "yt-dlp is not installed or not in your PATH.\n\n"
                         "Please install it:\n"
-                        "• Using pip: pip install yt-dlp\n"
+                        '• Using pip (Python 3.11+): pip install -U "yt-dlp[default]"\n'
                         "• Using your package manager (e.g., apt, dnf, pacman)\n"
                         "• Or visit: https://github.com/yt-dlp/yt-dlp"
                     )
