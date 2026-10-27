@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QComboBox, QTextEdit, QTabWidget,
     QGroupBox, QCheckBox, QFileDialog, QMessageBox, QProgressBar, QSizePolicy,
-    QTableWidget, QTableWidgetItem, QHeaderView
+    QTableWidget, QTableWidgetItem, QHeaderView, QScrollArea, QFrame, QGridLayout
 )
 from PySide6.QtCore import Qt, QProcess, QUrl, QTimer, QRegularExpression, QStandardPaths
 from PySide6.QtGui import (
@@ -376,7 +376,7 @@ class YtDlpGUI(CommandMixin, QMainWindow):
 
             logo_pixmap = QPixmap(str(logo_path))
             self.about_logo_label.setPixmap(logo_pixmap.scaled(
-                128, 128,
+                self.about_logo_label.width(), self.about_logo_label.height(),
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation
             ))
@@ -915,266 +915,143 @@ class YtDlpGUI(CommandMixin, QMainWindow):
         label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
 
     def create_about_tab(self):
-        """Show application details, update controls, and dependency status."""
+        """Build a compact About page that scrolls when display scaling needs more space."""
         about_widget = QWidget()
+        about_widget.setObjectName("aboutContent")
+        about_widget.setStyleSheet(
+            'QLabel { font-size: 13px; }'
+            'QLabel#aboutTitle { font-size: 18px; font-weight: bold; }'
+            'QLabel[aboutHeading="true"] { font-size: 14px; font-weight: bold; }'
+        )
         layout = QVBoxLayout(about_widget)
-        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(16)
 
         header_layout = QHBoxLayout()
-        header_layout.addStretch()
-
+        header_layout.setSpacing(16)
         self.about_logo_label = QLabel()
-        self.about_logo_label.setFixedSize(128, 128)
+        self.about_logo_label.setFixedSize(80, 80)
         self.about_logo_label.setScaledContents(True)
         self.about_logo_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         header_layout.addWidget(self.about_logo_label)
 
-        header_layout.addSpacing(20)
-
-        version_widget = QWidget()
-        version_layout = QVBoxLayout(version_widget)
-        version_layout.setContentsMargins(0, 0, 0, 0)
-        version_layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
-
+        version_layout = QVBoxLayout()
+        version_layout.setSpacing(4)
+        version_layout.addStretch()
         app_title = QLabel("mme89 yt-dlp GUI")
-        app_title_font = QFont()
-        app_title_font.setPointSize(16)
-        app_title_font.setBold(True)
-        app_title.setFont(app_title_font)
+        app_title.setObjectName("aboutTitle")
         version_layout.addWidget(app_title)
-
         version_label = QLabel(f"Version {APP_VERSION}")
         version_label.setStyleSheet(f"color: {self.COLORS['text_secondary']};")
         version_layout.addWidget(version_label)
+        version_layout.addStretch()
+        header_layout.addLayout(version_layout, 1)
 
+        update_layout = QVBoxLayout()
+        update_layout.setSpacing(6)
+        update_layout.addStretch()
+        self.check_updates_button = QPushButton("Check for Updates")
+        self.check_updates_button.clicked.connect(self.check_for_updates)
+        update_layout.addWidget(self.check_updates_button, 0, Qt.AlignmentFlag.AlignRight)
         self.update_status_label = QLabel("Updates are checked automatically.")
-        self.update_status_label.setWordWrap(True)
+        self.configure_about_status_label(self.update_status_label)
+        self.update_status_label.setMaximumWidth(360)
+        self.update_status_label.setAlignment(Qt.AlignmentFlag.AlignRight)
         self.update_status_label.setTextFormat(Qt.TextFormat.RichText)
         self.update_status_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextBrowserInteraction
         )
         self.update_status_label.setOpenExternalLinks(True)
-        version_layout.addWidget(self.update_status_label)
-        self.check_updates_button = QPushButton("Check for Updates")
-        self.check_updates_button.clicked.connect(self.check_for_updates)
-        version_layout.addWidget(self.check_updates_button)
-
-        header_layout.addWidget(version_widget)
-        header_layout.addStretch()
-
+        self.update_status_label.setStyleSheet(f"color: {self.COLORS['text_secondary']};")
+        update_layout.addWidget(self.update_status_label)
+        update_layout.addStretch()
+        header_layout.addLayout(update_layout, 1)
         layout.addLayout(header_layout)
 
-        layout.addSpacing(20)
-
-        desc_label = QLabel(
+        description = QLabel(
             "A graphical interface for yt-dlp with format selection, "
             "playlist support, and download queue management."
         )
-        desc_label.setWordWrap(True)
-        desc_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(desc_label)
-
-        layout.addSpacing(5)
-
-        github_label = QLabel(
-            'GitHub: <a href="https://github.com/mme89/yt-dlp-gui">github.com/mme89/yt-dlp-gui</a>'
+        description.setWordWrap(True)
+        layout.addWidget(description)
+        project_links = QLabel(
+            '<a href="https://github.com/mme89/yt-dlp-gui">GitHub</a>'
+            ' · Licensed under GNU GPL v3+ · '
+            '<a href="https://github.com/mme89/yt-dlp-gui/blob/main/LICENSE">View license</a>'
         )
-        github_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        github_label.setTextFormat(Qt.TextFormat.RichText)
-        github_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
-        github_label.setOpenExternalLinks(True)
-        github_label.setStyleSheet(f"color: {self.COLORS['text_secondary']};")
-        layout.addWidget(github_label)
+        project_links.setWordWrap(True)
+        project_links.setOpenExternalLinks(True)
+        layout.addWidget(project_links)
 
-        layout.addSpacing(5)
-
-        license_info = QLabel(
-            'Licensed under GNU GPL v3+ - '
-            '<a href="https://github.com/mme89/yt-dlp-gui/blob/main/LICENSE">View License</a>'
+        dependencies = QGridLayout()
+        dependencies.setHorizontalSpacing(24)
+        dependencies.setVerticalSpacing(10)
+        dependency_details = (
+            (
+                "yt-dlp", "ytdlp_version_label", "Checking version…",
+                f"Core download engine. Recommended: {RECOMMENDED_YTDLP_VERSION} or newer."
+                "<br><br>Python installs require Python 3.11+. "
+                "Windows binaries require Windows 10+.",
+                '<a href="https://github.com/yt-dlp/yt-dlp">yt-dlp on GitHub</a>',
+            ),
+            (
+                "JS Runtime", "js_runtime_version_label", "Checking runtime…",
+                "Used for YouTube JavaScript extraction. "
+                "Prefer Deno 2.3+ or Node.js 22+."
+                "<br><br>QuickJS is also supported. "
+                "Bun is deprecated (1.2.11–1.3.14 only).",
+                '<a href="https://github.com/yt-dlp/yt-dlp/wiki/EJS">Runtime setup guide</a>',
+            ),
+            (
+                "yt-dlp-ejs", "ytdlp_ejs_status_label", "Managed by yt-dlp (not verified)",
+                "Challenge solver scripts for full YouTube support. "
+                "Included in official yt-dlp binaries."
+                "<br><br>For pip installs: pip install -U &quot;yt-dlp[default]&quot; "
+                "in the environment containing yt-dlp.",
+                '<a href="https://github.com/yt-dlp/ejs">EJS on GitHub</a>',
+            ),
+            (
+                "FFmpeg", "ffmpeg_version_label", "Checking version…",
+                "Used for merging video and audio streams.",
+                '<a href="https://github.com/FFmpeg/FFmpeg">FFmpeg on GitHub</a>',
+            ),
         )
-        license_info.setWordWrap(True)
-        license_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        license_info.setTextFormat(Qt.TextFormat.RichText)
-        license_info.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
-        license_info.setOpenExternalLinks(True)
-        license_info.setStyleSheet(f"color: {self.COLORS['text_secondary']}; font-size: 10pt;")
-        layout.addWidget(license_info)
-
-        layout.addSpacing(20)
-
-        powered_by_container = QWidget()
-        powered_by_container.setMinimumWidth(1000)
-        powered_by_container.setMaximumWidth(1080)
-        powered_by_container.setSizePolicy(
-            QSizePolicy.Policy.Expanding,
-            QSizePolicy.Policy.Preferred,
-        )
-        powered_by_layout = QHBoxLayout(powered_by_container)
-        powered_by_layout.setContentsMargins(0, 0, 0, 0)
-        powered_by_layout.setSpacing(48)
-
-        ytdlp_widget = QWidget()
-        ytdlp_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        ytdlp_layout = QVBoxLayout(ytdlp_widget)
-        ytdlp_layout.setContentsMargins(0, 0, 0, 0)
-
-        ytdlp_label = QLabel("yt-dlp")
-        ytdlp_font = QFont()
-        ytdlp_font.setPointSize(14)
-        ytdlp_font.setBold(True)
-        ytdlp_label.setFont(ytdlp_font)
-        ytdlp_layout.addWidget(ytdlp_label)
-
-        self.ytdlp_version_label = QLabel("Checking version...")
-        self.configure_about_status_label(self.ytdlp_version_label)
-        self.ytdlp_version_label.setStyleSheet(
-            f"color: {self.COLORS['text_secondary']}; font-style: italic;"
-        )
-        ytdlp_layout.addWidget(self.ytdlp_version_label)
-
-        ytdlp_layout.addSpacing(10)
-
-        ytdlp_info = QLabel(
-            'Core download engine.<br>'
-            'Feature-rich command-line<br>'
-            'audio/video downloader.<br><br>'
-            f'Recommended: yt-dlp {RECOMMENDED_YTDLP_VERSION} or newer.<br>'
-            'Python installs require Python 3.11+.<br>'
-            'Windows binaries require Windows 10+.<br><br>'
-            'GitHub: <a href="https://github.com/yt-dlp/yt-dlp">yt-dlp/yt-dlp</a>'
-        )
-        ytdlp_info.setWordWrap(True)
-        ytdlp_info.setTextFormat(Qt.TextFormat.RichText)
-        ytdlp_info.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
-        ytdlp_info.setOpenExternalLinks(True)
-        ytdlp_layout.addWidget(ytdlp_info)
-        ytdlp_layout.addStretch()
-
-        powered_by_layout.addWidget(ytdlp_widget, 1)
-
-        js_runtime_widget = QWidget()
-        js_runtime_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        js_runtime_layout = QVBoxLayout(js_runtime_widget)
-        js_runtime_layout.setContentsMargins(0, 0, 0, 0)
-
-        js_runtime_label = QLabel("JS Runtime")
-        js_runtime_font = QFont()
-        js_runtime_font.setPointSize(14)
-        js_runtime_font.setBold(True)
-        js_runtime_label.setFont(js_runtime_font)
-        js_runtime_layout.addWidget(js_runtime_label)
-
-        self.js_runtime_version_label = QLabel("Checking runtime...")
-        self.configure_about_status_label(self.js_runtime_version_label)
-        self.js_runtime_version_label.setStyleSheet(
-            f"color: {self.COLORS['text_secondary']}; font-style: italic;"
-        )
-        js_runtime_layout.addWidget(self.js_runtime_version_label)
-
-        js_runtime_layout.addSpacing(10)
-
-        js_runtime_info = QLabel(
-            'Used by yt-dlp for YouTube<br>'
-            'JavaScript extraction.<br><br>'
-            'Recommended: Deno 2.3+ or Node.js 22+.<br>'
-            'QuickJS is also supported.<br>'
-            'Bun is deprecated (1.2.11–1.3.14 only).<br><br>'
-            'Docs: <a href="https://github.com/yt-dlp/yt-dlp/wiki/EJS">yt-dlp EJS wiki</a>'
-        )
-        js_runtime_info.setWordWrap(True)
-        js_runtime_info.setTextFormat(Qt.TextFormat.RichText)
-        js_runtime_info.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
-        js_runtime_info.setOpenExternalLinks(True)
-        js_runtime_layout.addWidget(js_runtime_info)
-        js_runtime_layout.addStretch()
-
-        powered_by_layout.addWidget(js_runtime_widget, 1)
-
-        ytdlp_ejs_widget = QWidget()
-        ytdlp_ejs_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        ytdlp_ejs_layout = QVBoxLayout(ytdlp_ejs_widget)
-        ytdlp_ejs_layout.setContentsMargins(0, 0, 0, 0)
-
-        ytdlp_ejs_label = QLabel("yt-dlp-ejs")
-        ytdlp_ejs_font = QFont()
-        ytdlp_ejs_font.setPointSize(14)
-        ytdlp_ejs_font.setBold(True)
-        ytdlp_ejs_label.setFont(ytdlp_ejs_font)
-        ytdlp_ejs_layout.addWidget(ytdlp_ejs_label)
-
-        self.ytdlp_ejs_status_label = QLabel("Checking package...")
-        self.configure_about_status_label(self.ytdlp_ejs_status_label)
-        self.ytdlp_ejs_status_label.setStyleSheet(
-            f"color: {self.COLORS['text_secondary']}; font-style: italic;"
-        )
-        ytdlp_ejs_layout.addWidget(self.ytdlp_ejs_status_label)
-
-        ytdlp_ejs_layout.addSpacing(10)
-
-        ytdlp_ejs_info = QLabel(
-            'Required by yt-dlp for full YouTube support.<br><br>'
-            'Included in official yt-dlp binaries.<br>'
-            'For pip installs, use:<br>'
-            '<code>pip install -U &quot;yt-dlp[default]&quot;</code><br>'
-            'Run this in the environment containing yt-dlp.<br><br>'
-            'Package: <a href="https://github.com/yt-dlp/ejs">yt-dlp/ejs</a>'
-        )
-        ytdlp_ejs_info.setWordWrap(True)
-        ytdlp_ejs_info.setTextFormat(Qt.TextFormat.RichText)
-        ytdlp_ejs_info.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
-        ytdlp_ejs_info.setOpenExternalLinks(True)
-        ytdlp_ejs_layout.addWidget(ytdlp_ejs_info)
-        ytdlp_ejs_layout.addStretch()
-
-        powered_by_layout.addWidget(ytdlp_ejs_widget, 1)
-
-        ffmpeg_widget = QWidget()
-        ffmpeg_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        ffmpeg_layout = QVBoxLayout(ffmpeg_widget)
-        ffmpeg_layout.setContentsMargins(0, 0, 0, 0)
-
-        ffmpeg_label = QLabel("FFmpeg")
-        ffmpeg_font = QFont()
-        ffmpeg_font.setPointSize(14)
-        ffmpeg_font.setBold(True)
-        ffmpeg_label.setFont(ffmpeg_font)
-        ffmpeg_layout.addWidget(ffmpeg_label)
-
-        self.ffmpeg_version_label = QLabel("Checking version...")
-        self.configure_about_status_label(self.ffmpeg_version_label)
-        self.ffmpeg_version_label.setStyleSheet(
-            f"color: {self.COLORS['text_secondary']}; font-style: italic;"
-        )
-        ffmpeg_layout.addWidget(self.ffmpeg_version_label)
-
-        ffmpeg_layout.addSpacing(10)
-
-        ffmpeg_info = QLabel(
-            'Used for merging video<br>'
-            'and audio streams.<br><br><br>'
-            'GitHub: <a href="https://github.com/FFmpeg/FFmpeg">FFmpeg/FFmpeg</a>'
-        )
-        ffmpeg_info.setWordWrap(True)
-        ffmpeg_info.setTextFormat(Qt.TextFormat.RichText)
-        ffmpeg_info.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
-        ffmpeg_info.setOpenExternalLinks(True)
-        ffmpeg_layout.addWidget(ffmpeg_info)
-        ffmpeg_layout.addStretch()
-
-        powered_by_layout.addWidget(ffmpeg_widget, 1)
-
-        layout.addWidget(powered_by_container, 0, Qt.AlignmentFlag.AlignHCenter)
-
+        for column, (title, status_name, initial_status, details, link) in enumerate(
+            dependency_details
+        ):
+            dependencies.setColumnStretch(column, 1)
+            heading = QLabel(title)
+            heading.setProperty("aboutHeading", True)
+            dependencies.addWidget(heading, 0, column)
+            status = QLabel(initial_status)
+            self.configure_about_status_label(status)
+            status.setTextFormat(Qt.TextFormat.PlainText)
+            status.setStyleSheet(f"color: {self.COLORS['text_secondary']};")
+            setattr(self, status_name, status)
+            dependencies.addWidget(status, 1, column, Qt.AlignmentFlag.AlignTop)
+            info = QLabel(details)
+            self.configure_about_status_label(info)
+            info.setTextFormat(Qt.TextFormat.RichText)
+            dependencies.addWidget(info, 2, column, Qt.AlignmentFlag.AlignTop)
+            docs_link = QLabel(link)
+            docs_link.setWordWrap(True)
+            docs_link.setOpenExternalLinks(True)
+            dependencies.addWidget(docs_link, 3, column, Qt.AlignmentFlag.AlignTop)
+        layout.addLayout(dependencies)
         layout.addStretch()
 
-        layout.addSpacing(10)
+        footer = QLabel("© 2025-2026 mme89")
+        footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        footer.setStyleSheet(f"color: {self.COLORS['text_secondary']};")
+        layout.addWidget(footer)
 
-        footer_label = QLabel("© 2025-2026 mme89")
-        footer_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        footer_label.setStyleSheet(f"color: {self.COLORS['text_secondary']}; margin-top: 20px;")
-        layout.addWidget(footer_label)
-
-        self.tabs.addTab(about_widget, "About")
+        self.about_scroll_area = QScrollArea()
+        self.about_scroll_area.setObjectName("aboutScrollArea")
+        self.about_scroll_area.setWidgetResizable(True)
+        self.about_scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.about_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.about_scroll_area.setWidget(about_widget)
+        self.tabs.addTab(self.about_scroll_area, "About")
 
     def check_for_updates(self):
         """Check the GUI's published releases in the background."""

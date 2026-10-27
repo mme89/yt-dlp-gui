@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtNetwork import QNetworkReply
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QLabel, QMessageBox
 
 from yt_dlp_gui.app import YtDlpGUI
 from yt_dlp_gui.updates import LATEST_RELEASE_API, UpdateChecker, available_release
@@ -149,8 +149,8 @@ class UpdateCheckerTests(unittest.TestCase):
         self.assertEqual(self.results, [])
 
 
-class UpdateNotificationTests(unittest.TestCase):
-    """Check update notifications and their lifecycle in the main window."""
+class AppWindowTests(unittest.TestCase):
+    """Check update notifications and About layout behavior in the main window."""
 
     @classmethod
     def setUpClass(cls):
@@ -204,6 +204,36 @@ class UpdateNotificationTests(unittest.TestCase):
         self.window.check_for_updates()
         self.reply.finished.emit()
         self.assertIsNotNone(self.window.update_notification)
+
+    def test_about_text_scrolls_without_clipping_in_a_short_viewport(self):
+        self.window.tabs.setCurrentWidget(self.window.about_scroll_area)
+        self.window.js_runtime_version_label.setText(
+            'Using: Deno deno 2.9.8 (stable, release, aarch64-apple-darwin)'
+        )
+        self.window.ytdlp_ejs_status_label.setText(
+            'Managed by your yt-dlp installation (not verified)'
+        )
+        self.window.update_status_label.setText(
+            'You’re up to date with the latest stable release.'
+        )
+        self.window.setFixedSize(900, 640)
+        self.window.show()
+        for _ in range(5):
+            self.app.processEvents()
+        scroll = self.window.about_scroll_area
+        self.assertGreater(scroll.verticalScrollBar().maximum(), 0)
+        self.assertEqual(scroll.horizontalScrollBar().maximum(), 0)
+        for label in scroll.widget().findChildren(QLabel):
+            if label.wordWrap():
+                with self.subTest(text=label.text()):
+                    self.assertGreaterEqual(label.height(), label.heightForWidth(label.width()))
+        scroll.verticalScrollBar().setValue(scroll.verticalScrollBar().maximum())
+        self.app.processEvents()
+        footer = next(label for label in scroll.widget().findChildren(QLabel)
+                      if label.text().startswith('©'))
+        self.assertTrue(scroll.viewport().rect().contains(
+            footer.mapTo(scroll.viewport(), footer.rect().bottomRight())
+        ))
 
     def test_close_cancels_request_and_timers(self):
         self.window.check_for_updates()

@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.5.1] - 2026-10-27
+
+### Fixed
+- Compact the About header by placing update controls beside the app version
+- Use consistent About text styling and align dependency details without clipped content
+- Allow the About page to scroll when display scaling or a smaller viewport needs more space
+
 ## [1.5.0] - 2026-10-27
 
 ### Added
