@@ -5,7 +5,8 @@ This application provides an easy-to-use graphical interface for downloading vid
 without using the command line.
 """
 
-# pylint: disable=no-name-in-module,attribute-defined-outside-init
+# The existing main window keeps its UI layout and event wiring in one module.
+# pylint: disable=too-many-lines
 import os
 import sys
 import json
@@ -21,13 +22,16 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView
 )
 from PySide6.QtCore import Qt, QProcess, QUrl, QTimer, QRegularExpression, QStandardPaths
-from PySide6.QtGui import QFont, QPixmap, QColor, QIcon, QRegularExpressionValidator
+from PySide6.QtGui import (
+    QFont, QPixmap, QColor, QIcon, QRegularExpressionValidator, QDesktopServices
+)
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
 
 from .commands import CommandMixin
 from .compatibility import RECOMMENDED_YTDLP_VERSION, is_supported_runtime, needs_ytdlp_update
 from .process_utils import hidden_subprocess_kwargs
 from .terminal_window import TerminalWindow
+from .updates import UpdateChecker
 from .version import APP_VERSION
 from .workers import DownloadThread, FormatFetcher
 
@@ -36,6 +40,7 @@ APP_ROOT = Path(__file__).resolve().parent.parent
 
 
 class YtDlpGUI(CommandMixin, QMainWindow):
+    """Main window coordinating downloads, settings, and background workers."""
     COLORS = {
         'background': '#f5f5f5',
         'surface': '#ffffff',
@@ -64,6 +69,7 @@ class YtDlpGUI(CommandMixin, QMainWindow):
     }
 
     def __init__(self):
+        """Initialize application state, build the interface, and schedule update checks."""
         super().__init__()
         self.legacy_config_file = APP_ROOT / "settings.json"
         self.config_file = self.get_config_file_path()
@@ -90,6 +96,10 @@ class YtDlpGUI(CommandMixin, QMainWindow):
         self.active_thumbnail_reply = None
         self.is_closing = False
         self.settings_save_timer = None
+        self.update_checker = UpdateChecker(APP_VERSION, self)
+        self.update_checker.finished.connect(self.on_update_check_finished)
+        self.notified_update_versions = set()
+        self.update_notification = None
 
         self.init_ui()
         self.setup_logo()
@@ -100,6 +110,14 @@ class YtDlpGUI(CommandMixin, QMainWindow):
         self.check_ffmpeg_version()
         self.check_js_runtime_version()
         self.check_ytdlp_ejs_status()
+        self.update_startup_timer = QTimer(self)
+        self.update_startup_timer.setSingleShot(True)
+        self.update_startup_timer.timeout.connect(self.check_for_updates)
+        self.update_startup_timer.start(1500)
+        self.update_timer = QTimer(self)
+        self.update_timer.setInterval(7 * 24 * 60 * 60 * 1000)
+        self.update_timer.timeout.connect(self.check_for_updates)
+        self.update_timer.start()
 
     def apply_stylesheet(self):
         """Apply consistent stylesheet across all platforms"""
@@ -364,6 +382,7 @@ class YtDlpGUI(CommandMixin, QMainWindow):
             ))
 
     def init_ui(self):
+        """Build the main window, URL controls, and feature tabs."""
         self.setWindowTitle(f"mme89 yt-dlp GUI - v{APP_VERSION}")
         self.setFixedSize(1200, 900)
 
@@ -439,6 +458,7 @@ class YtDlpGUI(CommandMixin, QMainWindow):
         self.statusBar().showMessage("Ready")
 
     def create_download_tab(self):
+        """Build format selection, subtitle controls, and download actions."""
         download_widget = QWidget()
         layout = QVBoxLayout(download_widget)
 
@@ -570,6 +590,7 @@ class YtDlpGUI(CommandMixin, QMainWindow):
         self.tabs.addTab(download_widget, "Download")
 
     def create_playlist_tab(self):
+        """Build playlist loading and selective download controls."""
         playlist_widget = QWidget()
         layout = QVBoxLayout(playlist_widget)
 
@@ -629,6 +650,7 @@ class YtDlpGUI(CommandMixin, QMainWindow):
         self.tabs.addTab(playlist_widget, "Playlist")
 
     def create_queue_tab(self):
+        """Build the download queue table and processing controls."""
         queue_widget = QWidget()
         layout = QVBoxLayout(queue_widget)
 
@@ -673,6 +695,7 @@ class YtDlpGUI(CommandMixin, QMainWindow):
         self.tabs.addTab(queue_widget, "Queue")
 
     def create_advanced_tab(self):
+        """Build custom command and metadata inspection controls."""
         advanced_widget = QWidget()
         layout = QVBoxLayout(advanced_widget)
 
@@ -709,6 +732,7 @@ class YtDlpGUI(CommandMixin, QMainWindow):
         self.tabs.addTab(advanced_widget, "Advanced")
 
     def create_options_tab(self):
+        """Build settings for tool paths, download rates, and output preferences."""
         options_widget = QWidget()
         layout = QVBoxLayout(options_widget)
         layout.setSpacing(0)
@@ -891,6 +915,7 @@ class YtDlpGUI(CommandMixin, QMainWindow):
         label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
 
     def create_about_tab(self):
+        """Show application details, update controls, and dependency status."""
         about_widget = QWidget()
         layout = QVBoxLayout(about_widget)
         layout.setAlignment(Qt.AlignmentFlag.AlignTop)
@@ -921,6 +946,18 @@ class YtDlpGUI(CommandMixin, QMainWindow):
         version_label = QLabel(f"Version {APP_VERSION}")
         version_label.setStyleSheet(f"color: {self.COLORS['text_secondary']};")
         version_layout.addWidget(version_label)
+
+        self.update_status_label = QLabel("Updates are checked automatically.")
+        self.update_status_label.setWordWrap(True)
+        self.update_status_label.setTextFormat(Qt.TextFormat.RichText)
+        self.update_status_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextBrowserInteraction
+        )
+        self.update_status_label.setOpenExternalLinks(True)
+        version_layout.addWidget(self.update_status_label)
+        self.check_updates_button = QPushButton("Check for Updates")
+        self.check_updates_button.clicked.connect(self.check_for_updates)
+        version_layout.addWidget(self.check_updates_button)
 
         header_layout.addWidget(version_widget)
         header_layout.addStretch()
@@ -1139,6 +1176,60 @@ class YtDlpGUI(CommandMixin, QMainWindow):
 
         self.tabs.addTab(about_widget, "About")
 
+    def check_for_updates(self):
+        """Check the GUI's published releases in the background."""
+        if self.is_closing:
+            return
+        if self.update_checker.check():
+            self.check_updates_button.setEnabled(False)
+            self.update_status_label.setText("Checking for updates…")
+
+    def on_update_check_finished(self, status, version, release_url):
+        """Keep a release link in About and notify once per version per session."""
+        if self.is_closing:
+            return
+        self.check_updates_button.setEnabled(True)
+        if status == "error":
+            self.update_status_label.setText("Could not check for updates. Please try again later.")
+        elif status == "current":
+            self.update_status_label.setText("You’re up to date with the latest stable release.")
+        else:
+            self.update_status_label.setText(
+                f'Update available: {version}. <a href="{release_url}">View release</a>'
+            )
+            if version in self.notified_update_versions:
+                return
+            self.notified_update_versions.add(version)
+            if self.update_notification is not None:
+                self.update_notification.close()
+            notification = QMessageBox(self)
+            notification.setWindowTitle("Update Available")
+            notification.setIcon(QMessageBox.Icon.Information)
+            notification.setTextFormat(Qt.TextFormat.PlainText)
+            notification.setText(
+                f"yt-dlp GUI {version} is available. You’re running {APP_VERSION}."
+            )
+            notification.setInformativeText("Open the release page to download the new version.")
+            notification.setStandardButtons(
+                QMessageBox.StandardButton.Open | QMessageBox.StandardButton.Close
+            )
+            notification.button(QMessageBox.StandardButton.Open).setText("View release")
+            notification.setDefaultButton(QMessageBox.StandardButton.Close)
+            notification.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            notification.buttonClicked.connect(
+                lambda button: QDesktopServices.openUrl(QUrl(release_url))
+                if notification.standardButton(button) == QMessageBox.StandardButton.Open else None
+            )
+            notification.finished.connect(self.on_update_notification_closed)
+            self.update_notification = notification
+            # Show without a nested event loop or blocking the main window.
+            notification.setModal(False)
+            notification.show()
+
+    def on_update_notification_closed(self, _result):
+        """Release the reference to the dismissed update notification."""
+        self.update_notification = None
+
     def toggle_terminal_output(self, state):
         """Toggle visibility of terminal output window"""
         if Qt.CheckState(state) == Qt.CheckState.Checked:
@@ -1159,16 +1250,19 @@ class YtDlpGUI(CommandMixin, QMainWindow):
         self.show_terminal_checkbox.setChecked(False)
 
     def browse_destination(self):
+        """Select and display a destination directory for downloads."""
         directory = QFileDialog.getExistingDirectory(self, "Select Download Directory")
         if directory:
             self.destination_input.setText(directory)
 
     def browse_ytdlp_path(self):
+        """Select and display the yt-dlp executable path."""
         file_path, _ = QFileDialog.getOpenFileName(self, "Select yt-dlp Executable")
         if file_path:
             self.ytdlp_path_input.setText(file_path)
 
     def browse_ffmpeg_path(self):
+        """Select and display the FFmpeg executable path."""
         file_path, _ = QFileDialog.getOpenFileName(self, "Select FFmpeg Executable")
         if file_path:
             self.ffmpeg_path_input.setText(file_path)
@@ -1383,7 +1477,9 @@ class YtDlpGUI(CommandMixin, QMainWindow):
 
         return ["--js-runtimes", runtime_info["spec"]]
 
-    def get_executable_version(self, executable_path, version_args=("--version",), success_codes=(0,)):
+    def get_executable_version(
+        self, executable_path, version_args=("--version",), success_codes=(0,)
+    ):
         """Return the first line of version output, with a bounded timeout."""
         try:
             result = subprocess.run(
@@ -1458,7 +1554,9 @@ class YtDlpGUI(CommandMixin, QMainWindow):
             self.js_runtime_version_label.setStyleSheet(f"color: {color}; font-weight: bold;")
         elif runtime_info["source"] == "custom":
             self.js_runtime_version = runtime_info["spec"]
-            self.js_runtime_version_label.setText(f"Configured (not verified): {runtime_info['spec']}")
+            self.js_runtime_version_label.setText(
+                f"Configured (not verified): {runtime_info['spec']}"
+            )
             self.js_runtime_version_label.setStyleSheet(
                 f"color: {self.COLORS['info']}; font-weight: bold;"
             )
@@ -1622,6 +1720,7 @@ class YtDlpGUI(CommandMixin, QMainWindow):
                 process.deleteLater()
 
     def fetch_formats(self):
+        """Validate the URL and start fetching video metadata in the background."""
         if self.format_fetcher and self.format_fetcher.isRunning():
             self.download_page_status_label.setText("Already fetching formats...")
             return
@@ -1669,6 +1768,7 @@ class YtDlpGUI(CommandMixin, QMainWindow):
         self.format_fetcher.start()
 
     def on_formats_fetched(self, data):
+        """Populate format selectors and video details from the active fetcher."""
         fetcher = self.sender()
         if fetcher is not self.format_fetcher:
             if fetcher:
@@ -1797,12 +1897,12 @@ class YtDlpGUI(CommandMixin, QMainWindow):
             views_str = "Unknown"
 
         def format_count(count):
+            """Format a viewer count using compact thousands or millions suffixes."""
             if count >= 1_000_000:
                 return f"{count / 1_000_000:.1f}M"
-            elif count >= 1_000:
+            if count >= 1_000:
                 return f"{count / 1_000:.1f}K"
-            else:
-                return str(count)
+            return str(count)
 
         likes_parts = []
         if like_count:
@@ -1836,6 +1936,7 @@ class YtDlpGUI(CommandMixin, QMainWindow):
         self.analyze_btn.setEnabled(True)
 
     def on_fetch_error(self, error):
+        """Restore download controls and report an active metadata fetch failure."""
         fetcher = self.sender()
         if fetcher is not self.format_fetcher:
             if fetcher:
@@ -2027,6 +2128,7 @@ class YtDlpGUI(CommandMixin, QMainWindow):
         self.stop_queue_btn.setEnabled(self.is_processing_queue)
 
     def download_video(self):
+        """Validate the selected video and start downloading the chosen formats."""
         url = self.url_input.text().strip()
         if not url:
             QMessageBox.warning(self, "Error", "Please enter a URL first!")
@@ -2536,6 +2638,7 @@ class YtDlpGUI(CommandMixin, QMainWindow):
                 checkbox_item.setCheckState(Qt.CheckState.Unchecked)
 
     def execute_custom(self):
+        """Validate and run the custom yt-dlp arguments entered in the Advanced tab."""
         if self.get_validated_url() is None:
             return
 
@@ -2555,12 +2658,14 @@ class YtDlpGUI(CommandMixin, QMainWindow):
         self.run_yt_dlp(args, self.advanced_output)
 
     def get_metadata(self):
+        """Print the selected video metadata in the Advanced tab."""
         if self.get_validated_url() is None:
             return
 
         self.run_yt_dlp(["--print", "%()j"], self.advanced_output)
 
     def list_subtitles(self):
+        """Print available manual and automatic subtitle tables."""
         if self.get_validated_url() is None:
             return
 
@@ -2570,6 +2675,7 @@ class YtDlpGUI(CommandMixin, QMainWindow):
         )
 
     def run_yt_dlp(self, args, output_widget=None, *, is_download=False, format_display=""):
+        """Build a command and start a worker with output and progress handlers."""
         if self.warn_if_ytdlp_command_running():
             return False
 
@@ -2649,6 +2755,7 @@ class YtDlpGUI(CommandMixin, QMainWindow):
             self.download_thread.stop()
 
     def on_download_finished(self, exit_code, is_download, stop_requested=False):
+        """Restore controls and update the queue after a command finishes."""
         self.download_thread = None
         if self.is_closing:
             return
@@ -2716,6 +2823,11 @@ class YtDlpGUI(CommandMixin, QMainWindow):
     def cleanup_for_exit(self, interactive=True):
         """Tear down background activity and Qt objects before interpreter shutdown."""
         self.is_closing = True
+        self.update_startup_timer.stop()
+        self.update_timer.stop()
+        self.update_checker.cancel()
+        if self.update_notification is not None:
+            self.update_notification.close()
 
         if self.active_thumbnail_reply:
             try:
@@ -2760,7 +2872,7 @@ class YtDlpGUI(CommandMixin, QMainWindow):
 
         return True
 
-    def closeEvent(self, event):  # pylint: disable=invalid-name
+    def closeEvent(self, event):
         """Handle application close - cleanup running processes"""
         if not self.cleanup_for_exit(interactive=True):
             event.ignore()
@@ -2780,6 +2892,7 @@ class YtDlpGUI(CommandMixin, QMainWindow):
         return self.legacy_config_file
 
     def load_settings(self):
+        """Load saved preferences and migrate legacy settings when needed."""
         try:
             config_file = self.config_file
             migrate_legacy_settings = False
@@ -2847,6 +2960,7 @@ class YtDlpGUI(CommandMixin, QMainWindow):
         }
 
     def save_settings(self, show_feedback=True):
+        """Persist current preferences and optionally display save feedback."""
         try:
             self.config_file.parent.mkdir(parents=True, exist_ok=True)
             with open(self.config_file, 'w', encoding='utf-8') as f:
@@ -2864,12 +2978,14 @@ class YtDlpGUI(CommandMixin, QMainWindow):
                 print(f"Error auto-saving settings: {e}")
 
 def main():
+    """Create the Qt application and run it with orderly shutdown cleanup."""
     app = QApplication(sys.argv)
     app.setApplicationName("yt-dlp GUI")
     app.setOrganizationName("mme89")
     window = YtDlpGUI()
 
     def cleanup_window_on_quit():
+        """Stop window workers before the Qt application exits."""
         if window is not None:
             window.cleanup_for_exit(interactive=False)
 

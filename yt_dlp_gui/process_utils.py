@@ -1,4 +1,5 @@
-# pylint: disable=no-member
+"""Platform-specific subprocess options for launching tools from the GUI."""
+
 import subprocess
 import sys
 
@@ -8,4 +9,4 @@ def hidden_subprocess_kwargs():
     if sys.platform != "win32":
         return {}
 
-    return {"creationflags": subprocess.CREATE_NO_WINDOW}
+    return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW")}

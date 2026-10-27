@@ -1,0 +1,24 @@
+[tool.pylint.main]
+# Qt classes live in compiled extensions; allow Pylint to inspect their exports.
+extension-pkg-allow-list = ["PySide6"]
+
+[tool.pylint.typecheck]
+# Pylint models native Qt signals as methods. Limit the exception to the
+# signal names and signal operations used here; ordinary members stay checked.
+generated-members = [
+    '.*\.(timeout|clicked|currentIndexChanged|stateChanged|buttonClicked|finished|textChanged|aboutToQuit)\.(connect|disconnect|emit)$',
+]
+
+[tool.pylint.classes]
+# Qt widgets are initialized in these UI builders rather than only in __init__.
+defining-attr-methods = [
+    "__init__", "__new__", "setUp", "asyncSetUp", "__post_init__",
+    "init_ui", "create_download_tab", "create_playlist_tab", "create_queue_tab",
+    "create_advanced_tab", "create_options_tab", "create_about_tab",
+]
+
+[tool.pylint.basic]
+# These names implement Qt APIs and must retain their spelling.
+good-names = ["closeEvent", "readAll"]
+# Test method names describe the behavior; private helpers follow Pylint's default.
+no-docstring-rgx = "^(_|test_)"

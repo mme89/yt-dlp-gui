@@ -1,4 +1,5 @@
-# pylint: disable=no-name-in-module
+"""Separate Qt window for displaying and clearing yt-dlp output."""
+
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QHBoxLayout, QPushButton, QTextEdit, QVBoxLayout, QWidget
@@ -41,7 +42,7 @@ class TerminalWindow(QWidget):
 
         layout.addLayout(button_layout)
 
-    def closeEvent(self, event):  # pylint: disable=invalid-name
+    def closeEvent(self, event):
         """Handle window close event."""
         self.closed.emit()
         super().closeEvent(event)

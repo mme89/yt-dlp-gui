@@ -1,4 +1,5 @@
-# pylint: disable=no-name-in-module
+"""Build yt-dlp command arguments from GUI settings and format selections."""
+
 import os
 import re
 import shlex
@@ -148,7 +149,7 @@ class CommandMixin:
                     "Cannot download with both video and audio set to 'none'!",
                 )
                 return None
-            elif video_id == "none":
+            if video_id == "none":
                 format_id = audio_id if audio_id else "bestaudio"
                 format_display = "audio only"
             elif audio_id == "none":
@@ -199,10 +200,7 @@ class CommandMixin:
 
     def calculate_format_size(self, format_id):
         """Calculate total size for the given format ID."""
-        if not hasattr(self, "format_data"):
-            return "Unknown"
-
-        if not format_id:
+        if not hasattr(self, "format_data") or not format_id:
             return "Unknown"
 
         total_bytes = 0
@@ -224,17 +222,13 @@ class CommandMixin:
             if filesize:
                 total_bytes += filesize
 
-        if has_dynamic_part and not has_known_part:
-            return "Dynamic"
-
         if has_dynamic_part:
-            return "Partial" if total_bytes else "Dynamic"
+            return "Partial" if total_bytes and has_known_part else "Dynamic"
 
         if total_bytes == 0:
             return "Unknown"
-        elif total_bytes > 1024 * 1024 * 1024:
+        if total_bytes > 1024 * 1024 * 1024:
             return f"{total_bytes / (1024**3):.1f} GB"
-        elif total_bytes > 1024 * 1024:
+        if total_bytes > 1024 * 1024:
             return f"{total_bytes / (1024**2):.0f} MB"
-        else:
-            return f"{total_bytes / 1024:.0f} KB"
+        return f"{total_bytes / 1024:.0f} KB"

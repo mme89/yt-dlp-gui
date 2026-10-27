@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.5.0] - 2026-10-27
+
+### Added
+- Check for new stable GUI releases in the background after startup and every seven days while running
+- Notify users when a newer GUI release is available, with a link to its release page for manual download
+- Add a "Check for Updates" button and update status to the About tab
+- Handle offline connections, API errors, and timeouts without interrupting downloads, and cancel pending checks during shutdown
+
+### Changed
+- Add shared Qt-aware Pylint configuration and development setup instructions, replacing repeated signal exclusions and broad import/member suppressions
+- Clean up test fixtures, module documentation, and format-size/runtime helpers
+- Validate JavaScript runtime versions before automatic selection, prefer QuickJS over deprecated Bun, and show unsupported or unverified custom runtimes accurately
+- Respect custom `--no-js-runtimes` options without automatically enabling another runtime
+- Recommend yt-dlp 2026.10.26 or newer and document Python 3.11+ and Windows 10+ requirements for current yt-dlp installations
+- Update pip installation guidance to include yt-dlp's default dependencies and EJS scripts
+
+### Fixed
+- Stop reporting EJS as installed or missing based on the GUI's Python environment, which does not describe the external yt-dlp installation
+- Read QuickJS versions from help output and bound runtime version probes with a timeout
+
 ## [1.4.0] - 2026-06-14
 
 ### Added

@@ -1,4 +1,5 @@
-# pylint: disable=no-name-in-module
+"""Background Qt workers for yt-dlp metadata fetching and downloads."""
+
 import json
 import re
 import subprocess

@@ -125,9 +125,18 @@ The built application will be in the `dist/` folder.
 - **Advanced Tab**: Add custom yt-dlp arguments
 - **Options Tab**: Configure download paths and yt-dlp location
 
+## App updates
+
+The GUI checks GitHub for a new stable GUI release shortly after startup and every seven days while running. When a newer release is available, it shows a notification with a **View release** button so you can download it. You can also use **About → Check for Updates** at any time.
+
+Update checks run in the background. Offline connections and API limits do not interrupt downloads; you can retry from About. Checks use the public GitHub API without an account or token. Updates are installed manually, and this check covers the GUI rather than the separately installed yt-dlp executable.
+
 ## Configuration
 
-Settings are automatically saved to `settings.json` in the application directory, including:
+Packaged applications save `settings.json` in the platform's user configuration directory and migrate legacy settings automatically. Source runs use the repository's `settings.json`.
+
+Saved preferences include:
+
 - Download path
 - yt-dlp executable path
 - Window preferences
@@ -154,3 +163,20 @@ This project was created with the assistance of AI to provide a user-friendly in
 ## Contributing
 
 Contributions are welcome! Feel free to open issues or submit pull requests.
+
+Install the development dependencies into the same Python environment used to run the app:
+
+```bash
+python -m pip install -r requirements-dev.txt
+```
+
+Run the regression tests and check for lint errors:
+
+```bash
+QT_QPA_PLATFORM=offscreen python -m unittest discover -s tests -v
+python -m pylint --errors-only yt_dlp_gui tests yt-dlp-gui.py
+```
+
+The tests also select the offscreen Qt backend automatically when none is configured, so the test command works without the environment prefix on Windows. Run Pylint without `--errors-only` to review style and complexity findings as well.
+
+Shared Pylint settings live in `pyproject.toml`. They allow inspection of PySide6's compiled modules and handle the specific native Qt signals used by the app, without disabling import or member checks. The large main-window module retains a documented size exemption; its complexity findings remain visible. In VS Code, select the Python interpreter containing the app dependencies. Machine-specific interpreter paths belong in local settings, not the shared configuration.

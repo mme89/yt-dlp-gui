@@ -23,13 +23,10 @@ def is_supported_runtime(name: str, version_line: str | None) -> bool:
     if not match:
         return False
     version = tuple(map(int, match.groups()))
-    if name == "Deno":
-        return version >= (2, 3, 0)
-    if name == "Node":
-        return version >= (22, 0, 0)
     if name == "Bun":
         return (1, 2, 11) <= version <= (1, 3, 14)
-    return False
+    minimum = {"Deno": (2, 3, 0), "Node": (22, 0, 0)}.get(name)
+    return minimum is not None and version >= minimum
 
 
 def needs_ytdlp_update(version: str) -> bool:
