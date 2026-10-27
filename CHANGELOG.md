@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [1.5.1] - 2026-10-27
 
+### Changed
+- Simplify GitHub Actions run titles to show the release tag without the triggering username
+- Pin version validation, Linux builds, and release publishing to Ubuntu 24.04 to avoid automatic runner migration
+
 ### Fixed
 - Compact the About header by placing update controls beside the app version
 - Use consistent About text styling and align dependency details without clipped content
