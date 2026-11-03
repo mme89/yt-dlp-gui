@@ -1,7 +1,6 @@
 # yt-dlp GUI
 
 [![GitHub release](https://img.shields.io/github/v/release/mme89/yt-dlp-gui?label=Latest%20Release&style=for-the-badge)](https://github.com/mme89/yt-dlp-gui/releases/latest)
-[![GitHub downloads](https://img.shields.io/github/downloads/mme89/yt-dlp-gui/total?label=Total%20Downloads&style=for-the-badge)](https://github.com/mme89/yt-dlp-gui/releases)
 [![License](https://img.shields.io/github/license/mme89/yt-dlp-gui?style=for-the-badge)](https://github.com/mme89/yt-dlp-gui/blob/main/LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-blue?style=for-the-badge)](https://github.com/mme89/yt-dlp-gui)
 
