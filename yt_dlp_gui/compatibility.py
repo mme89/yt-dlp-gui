@@ -19,7 +19,7 @@ def is_supported_runtime(name: str, version_line: str | None) -> bool:
     match = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", version_line)
     # Node prints a leading v, which is a word character.
     if not match:
-        match = re.match(r"v(\d+)\.(\d+)\.(\d+)\b", version_line)
+        match = re.search(r"(?:^|\W)v(\d+)\.(\d+)\.(\d+)\b", version_line)
     if not match:
         return False
     version = tuple(map(int, match.groups()))
@@ -31,7 +31,7 @@ def is_supported_runtime(name: str, version_line: str | None) -> bool:
 
 def needs_ytdlp_update(version: str) -> bool:
     """Compare dated releases, including nightly versions with a dated prefix."""
-    match = re.match(r"^(\d{4})\.(\d{2})\.(\d{2})(?:\D|$)", version)
+    match = re.match(r"^(\d{4})\.(\d{1,2})\.(\d{1,2})(?:\D|$)", version)
     if not match:
         return False
     return tuple(map(int, match.groups())) < tuple(map(int, RECOMMENDED_YTDLP_VERSION.split('.')))

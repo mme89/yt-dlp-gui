@@ -80,7 +80,9 @@ class ReleaseVersionTests(unittest.TestCase):
                 available_release(payload, '1.4.0')
 
     def test_release_link_uses_known_repository(self):
-        _, url = available_release(release(html_url='https://example.com'), '1.4.0')
+        result = available_release(release(html_url='https://example.com'), '1.4.0')
+        assert result is not None
+        _, url = result
         self.assertEqual(url, 'https://github.com/mme89/yt-dlp-gui/releases/tag/v1.5.0')
 
 
@@ -184,6 +186,7 @@ class AppWindowTests(unittest.TestCase):
         self.assertIn('v2.0.0', self.window.update_status_label.text())
         notification = self.window.update_notification
         self.assertIsNotNone(notification)
+        assert notification is not None
         self.assertFalse(notification.isModal())
         with patch('yt_dlp_gui.app.QDesktopServices.openUrl') as open_url:
             notification.button(QMessageBox.StandardButton.Open).click()
@@ -221,15 +224,17 @@ class AppWindowTests(unittest.TestCase):
         for _ in range(5):
             self.app.processEvents()
         scroll = self.window.about_scroll_area
+        scroll_widget = scroll.widget()
+        assert scroll_widget is not None
         self.assertGreater(scroll.verticalScrollBar().maximum(), 0)
         self.assertEqual(scroll.horizontalScrollBar().maximum(), 0)
-        for label in scroll.widget().findChildren(QLabel):
+        for label in scroll_widget.findChildren(QLabel):
             if label.wordWrap():
                 with self.subTest(text=label.text()):
                     self.assertGreaterEqual(label.height(), label.heightForWidth(label.width()))
         scroll.verticalScrollBar().setValue(scroll.verticalScrollBar().maximum())
         self.app.processEvents()
-        footer = next(label for label in scroll.widget().findChildren(QLabel)
+        footer = next(label for label in scroll_widget.findChildren(QLabel)
                       if label.text().startswith('©'))
         self.assertTrue(scroll.viewport().rect().contains(
             footer.mapTo(scroll.viewport(), footer.rect().bottomRight())

@@ -3,10 +3,33 @@
 import json
 import re
 import subprocess
+import threading
 
 from PySide6.QtCore import QThread, Signal
 
-from .process_utils import hidden_subprocess_kwargs
+from .process_utils import managed_subprocess_kwargs, terminate_process_tree
+
+
+class ProbeWorker(QThread):
+    """Lightweight background thread for running a single dependency probe callable."""
+
+    result_ready = Signal(object)
+
+    def __init__(self, probe_fn):
+        super().__init__()
+        self._probe_fn = probe_fn
+        self._should_stop = False
+
+    def run(self):
+        if self._should_stop:
+            return
+        result = self._probe_fn()
+        if not self._should_stop:
+            self.result_ready.emit(result)
+
+    def stop(self, _force=False):
+        """Mark the probe cancelled so its result is discarded on completion."""
+        self._should_stop = True
 
 
 class FormatFetcher(QThread):
@@ -22,31 +45,44 @@ class FormatFetcher(QThread):
         self.ytdlp_path = ytdlp_path
         self.args_without_url = args_without_url or []
         self.process = None
+        self._should_stop = False
+        self._process_lock = threading.Lock()
+
+    @property
+    def stop_requested(self):
+        """Return whether the UI requested this fetcher to stop."""
+        return self._should_stop
 
     def run(self):
+        process = None
         try:
             cmd_args = self.args_without_url + [self.url]
             self.output.emit(f"Analyzing video: {self.url}\n")
             self.output.emit(f"Running: {self.ytdlp_path} {' '.join(cmd_args)}\n")
             self.output.emit("-" * 60 + "\n")
 
-            self.process = subprocess.Popen(
-                [self.ytdlp_path, *cmd_args],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                **hidden_subprocess_kwargs(),
-            )
+            with self._process_lock:
+                if self._should_stop:
+                    self.error.emit("Cancelled")
+                    return
+                process = subprocess.Popen(
+                    [self.ytdlp_path, *cmd_args],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    **managed_subprocess_kwargs(),
+                )
+                self.process = process
 
             self.output.emit("Fetching video information...\n")
-            stdout, stderr = self.process.communicate()
+            stdout, stderr = process.communicate()
 
-            if self.process.returncode != 0:
+            if process.returncode != 0:
                 error_output = stderr or ""
                 self.output.emit(f"\nError output:\n{error_output}\n")
-                self.error.emit("Failed to fetch formats")
+                self.error.emit(self._extract_error_message(error_output))
                 return
 
             output = stdout or ""
@@ -55,24 +91,29 @@ class FormatFetcher(QThread):
 
             data = json.loads(output)
             self.finished.emit(data)
-        except (OSError, RuntimeError, json.JSONDecodeError) as e:
+        except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as e:
             self.output.emit(f"\nException: {str(e)}\n")
             self.error.emit(str(e))
         finally:
-            self.process = None
+            with self._process_lock:
+                self.process = None
+
+    @staticmethod
+    def _extract_error_message(stderr_text):
+        """Extract the most informative error line from yt-dlp stderr."""
+        lines = [line.strip() for line in stderr_text.splitlines() if line.strip()]
+        for line in reversed(lines):
+            if line.startswith("ERROR:"):
+                return line.removeprefix("ERROR:").strip() or line
+        return lines[-1] if lines else "Failed to fetch formats"
 
     def stop(self, force=False):
-        """Stop the running yt-dlp metadata process."""
-        if self.process and self.process.poll() is None:
-            try:
-                self.process.terminate()
-                if force:
-                    try:
-                        self.process.wait(timeout=1.5)
-                    except subprocess.TimeoutExpired:
-                        self.process.kill()
-            except (OSError, subprocess.SubprocessError):
-                pass
+        """Stop the running yt-dlp metadata process and its child tree."""
+        with self._process_lock:
+            self._should_stop = True
+            process = self.process
+
+        terminate_process_tree(process, force=force, timeout=1.5)
 
 
 class DownloadThread(QThread):
@@ -89,6 +130,7 @@ class DownloadThread(QThread):
         self.ytdlp_path = ytdlp_path
         self.process = None
         self._should_stop = False
+        self._process_lock = threading.Lock()
         self.is_download = True
 
     @property
@@ -97,61 +139,72 @@ class DownloadThread(QThread):
         return self._should_stop
 
     def run(self):
+        process = None
         try:
-            self.process = subprocess.Popen(
-                [self.ytdlp_path, *self.args, self.url],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-                **hidden_subprocess_kwargs(),
-            )
+            with self._process_lock:
+                if self._should_stop:
+                    self.finished_signal.emit(-15)
+                    return
+                process = subprocess.Popen(
+                    [self.ytdlp_path, *self.args, self.url],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                    **managed_subprocess_kwargs(),
+                )
+                self.process = process
 
-            if self.process.stdout:
-                for line in self.process.stdout:
+            if process.stdout:
+                for line in process.stdout:
                     if not line:
                         continue
                     self.output.emit(line)
                     self._parse_progress(line)
 
-            exit_code = self.process.wait()
+            exit_code = process.wait()
             if self._should_stop and exit_code != 0:
                 exit_code = -15
             self.finished_signal.emit(exit_code)
+        except (OSError, subprocess.SubprocessError, ValueError) as e:
+            self.output.emit(f"\nFailed to run yt-dlp: {e}\n")
+            self.finished_signal.emit(-1)
         finally:
-            if self.process and self.process.stdout:
-                self.process.stdout.close()
-            self.process = None
+            if process and process.stdout:
+                process.stdout.close()
+            with self._process_lock:
+                self.process = None
 
     def _parse_progress(self, text):
         """Parse yt-dlp output for progress information."""
         match = re.search(r"\[download\]\s+(\d+\.?\d*)%", text)
         if match:
-            percentage = float(match.group(1))
+            percentage = min(100, max(0, int(float(match.group(1)))))
 
             status_parts = []
 
-            size_match = re.search(r"of\s+([\d.]+\w+)", text)
+            size_match = re.search(r"of\s+(~?\s*[\d.]+\w+)", text)
             if size_match:
-                status_parts.append(f"of {size_match.group(1)}")
+                size_str = re.sub(r"\s+", "", size_match.group(1))
+                status_parts.append(f"of {size_str}")
 
-            speed_match = re.search(r"at\s+([\d.]+\w+/s)", text)
+            speed_match = re.search(r"at\s+([\d.]+\w+/s|Unknown\s+\S+)", text)
             if speed_match:
                 status_parts.append(f"at {speed_match.group(1)}")
 
-            eta_match = re.search(r"ETA\s+([\d:]+)", text)
+            eta_match = re.search(r"ETA\s+([\d:]+|Unknown)", text)
             if eta_match:
                 status_parts.append(f"ETA {eta_match.group(1)}")
 
             status = " ".join(status_parts) if status_parts else "Downloading..."
-            self.progress.emit(int(percentage), status)
+            self.progress.emit(percentage, status)
 
         elif "[download] Destination:" in text:
             filename = text.split("Destination:")[-1].strip()
             self.progress.emit(0, f"Starting download: {filename}")
-        elif "[download] 100%" in text or "has already been downloaded" in text:
+        elif "has already been downloaded" in text:
             self.progress.emit(100, "Download complete!")
         elif "[Merger]" in text or "Merging formats" in text:
             self.progress.emit(100, "Merging video and audio...")
@@ -161,23 +214,17 @@ class DownloadThread(QThread):
             self.progress.emit(100, "Embedding subtitles...")
 
     def stop(self):
-        """Request the download to stop."""
-        self._should_stop = True
-        if self.process and self.process.poll() is None:
-            try:
-                self.process.terminate()
-            except (OSError, subprocess.SubprocessError):
-                pass
+        """Request the download process and its child tree to stop."""
+        with self._process_lock:
+            self._should_stop = True
+            process = self.process
+
+        terminate_process_tree(process, force=False)
 
     def stop_and_wait(self, timeout_ms=3000):
-        """Stop the download process and wait briefly before killing it."""
-        self._should_stop = True
-        if self.process and self.process.poll() is None:
-            try:
-                self.process.terminate()
-                try:
-                    self.process.wait(timeout=timeout_ms / 1000)
-                except subprocess.TimeoutExpired:
-                    self.process.kill()
-            except (OSError, subprocess.SubprocessError):
-                pass
+        """Stop the download process tree and wait briefly before killing it."""
+        with self._process_lock:
+            self._should_stop = True
+            process = self.process
+
+        terminate_process_tree(process, force=True, timeout=timeout_ms / 1000)

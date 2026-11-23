@@ -3,6 +3,7 @@
 import subprocess
 import unittest
 from types import MethodType, SimpleNamespace
+from typing import Any, cast
 from unittest.mock import Mock, patch
 
 from yt_dlp_gui.app import YtDlpGUI
@@ -75,7 +76,10 @@ class CompatibilityTests(unittest.TestCase):
 
     def test_quickjs_precedes_bun(self):
         harness = RuntimeHarness({'qjs': 'QuickJS version 2025-04-26', 'bun': '1.3.14'})
-        self.assertEqual(harness.detect_js_runtime()['name'], 'QuickJS')
+        runtime = harness.detect_js_runtime()
+        self.assertIsNotNone(runtime)
+        assert runtime is not None
+        self.assertEqual(runtime['name'], 'QuickJS')
 
     def test_unsupported_and_unreadable_runtimes_are_skipped(self):
         for versions in ({'node': 'v20.0.0', 'bun': '1.3.15'}, {'deno': None}, {}):
@@ -89,7 +93,10 @@ class CompatibilityTests(unittest.TestCase):
             with self.subTest(options=options):
                 harness = RuntimeHarness({'deno': 'deno 2.3.0'}, options)
                 self.assertEqual(harness.get_js_runtime_args(), [])
-                self.assertEqual(harness.detect_js_runtime()['source'], 'custom')
+                runtime = harness.detect_js_runtime()
+                self.assertIsNotNone(runtime)
+                assert runtime is not None
+                self.assertEqual(runtime['source'], 'custom')
 
     def test_custom_unsupported_version_warns(self):
         harness = RuntimeHarness({'node': 'v20.0.0'}, ['--js-runtimes', 'node'])
@@ -111,7 +118,7 @@ class CompatibilityTests(unittest.TestCase):
         result = SimpleNamespace(
             returncode=1, stdout='', stderr='QuickJS version 2025-04-26\nusage...'
         )
-        with patch('yt_dlp_gui.app.subprocess.run', return_value=result) as run:
+        with patch('yt_dlp_gui.probes.subprocess.run', return_value=result) as run:
             self.assertEqual(
                 harness.get_runtime_version('QuickJS', '/fake/qjs'), 'QuickJS version 2025-04-26'
             )
@@ -120,15 +127,15 @@ class CompatibilityTests(unittest.TestCase):
 
     def test_nonzero_version_probe_is_rejected_for_node(self):
         result = SimpleNamespace(returncode=1, stdout='v22.0.0', stderr='')
-        with patch('yt_dlp_gui.app.subprocess.run', return_value=result):
-            self.assertIsNone(YtDlpGUI.get_executable_version(None, '/fake/node'))
+        with patch('yt_dlp_gui.probes.subprocess.run', return_value=result):
+            self.assertIsNone(YtDlpGUI.get_executable_version(cast(Any, None), '/fake/node'))
 
     def test_probe_failure_is_not_selected(self):
         for error in (OSError('missing'), subprocess.TimeoutExpired('node', 3)):
             with self.subTest(error=error), patch(
-                'yt_dlp_gui.app.subprocess.run', side_effect=error
+                'yt_dlp_gui.probes.subprocess.run', side_effect=error
             ):
-                self.assertIsNone(YtDlpGUI.get_executable_version(None, '/fake/node'))
+                self.assertIsNone(YtDlpGUI.get_executable_version(cast(Any, None), '/fake/node'))
 
     def test_ejs_status_does_not_claim_external_package_availability(self):
         harness = RuntimeHarness()

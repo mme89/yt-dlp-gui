@@ -174,6 +174,6 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='../assets/logo.png',  # PyInstaller will convert to .ico if Pillow is installed
+    icon='../assets/logo.ico',
     version=WINDOWS_VERSION_FILE,
 )

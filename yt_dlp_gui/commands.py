@@ -3,10 +3,74 @@
 import os
 import re
 import shlex
-from typing import Any, cast
+import sys
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, cast
 
 from PySide6.QtCore import QStandardPaths
 from PySide6.QtWidgets import QMessageBox, QWidget
+
+from .formatters import format_filesize
+
+
+_UNSAFE_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*%#\x00-\x1f]+')
+
+
+def split_cli_args(raw_args: str, *, posix: bool | None = None) -> list[str]:
+    """Split CLI arguments while preserving Windows backslash paths."""
+    use_posix = (sys.platform != "win32") if posix is None else posix
+    if use_posix:
+        return shlex.split(raw_args, posix=True)
+
+    tokens = []
+    current: list[str] = []
+    quote_char: str | None = None
+    in_token = False
+
+    for char in raw_args:
+        if quote_char is not None:
+            if char == quote_char:
+                quote_char = None
+            else:
+                current.append(char)
+        elif char in ('"', "'"):
+            quote_char = char
+            in_token = True
+        elif char.isspace():
+            if in_token:
+                tokens.append("".join(current))
+                current = []
+                in_token = False
+        else:
+            current.append(char)
+            in_token = True
+
+    if quote_char is not None:
+        raise ValueError("No closing quotation")
+    if in_token:
+        tokens.append("".join(current))
+    return tokens
+
+
+def sanitize_format_display(format_display: str, max_length: int = 60) -> str:
+    """Sanitize a format label so it is safe inside a yt-dlp output filename template."""
+    if not format_display:
+        return ""
+    sanitized = _UNSAFE_FILENAME_CHARS.sub("_", format_display)
+    sanitized = re.sub(r"\s+", " ", sanitized).strip(" ._-")
+    if len(sanitized) > max_length:
+        sanitized = sanitized[:max_length].rstrip(" ._-")
+    return sanitized
+
+
+def build_output_template(format_display: str, *, fallback_format_id: bool = False) -> str | None:
+    """Build a safe yt-dlp -o output template from a format display label."""
+    safe_display = sanitize_format_display(format_display)
+    if safe_display:
+        return f"%(title)s [{safe_display}].%(ext)s"
+    if fallback_format_id:
+        return "%(title)s [%(format_id)s].%(ext)s"
+    return None
 
 
 class CommandMixin:
@@ -21,19 +85,14 @@ class CommandMixin:
     format_input: Any
     video_combo: Any
     audio_combo: Any
+    video_container_combo: Any
+    audio_format_combo: Any
     format_data: dict[str, dict[str, Any]]
 
-    def get_js_runtime_args(self) -> list[str]:
-        """Return JS runtime args supplied by the main window."""
-        raise NotImplementedError
-
-    def get_ffmpeg_path(self) -> str:
-        """Return the configured ffmpeg path supplied by the main window."""
-        raise NotImplementedError
-
-    def add_subtitle_args(self, args: list[str]) -> None:
-        """Append subtitle args supplied by the main window."""
-        raise NotImplementedError
+    if TYPE_CHECKING:
+        get_js_runtime_args: Callable[[], list[str]]
+        get_ffmpeg_path: Callable[[], str]
+        add_subtitle_args: Callable[..., None]
 
     def get_custom_options_args(self):
         """Parse custom yt-dlp options entered in the UI."""
@@ -42,7 +101,7 @@ class CommandMixin:
             return []
 
         try:
-            return shlex.split(custom_options)
+            return split_cli_args(custom_options)
         except ValueError:
             return custom_options.split()
 
@@ -94,10 +153,11 @@ class CommandMixin:
         if output_template:
             args.extend(["-o", output_template])
 
-        rate_limit_args = self.get_rate_limit_args()
-        if rate_limit_args is None:
-            return None
-        args.extend(rate_limit_args)
+        if is_download:
+            rate_limit_args = self.get_rate_limit_args()
+            if rate_limit_args is None:
+                return None
+            args.extend(rate_limit_args)
 
         global_args = self.get_global_ytdlp_args()
         if is_download and "--newline" not in args and "--newline" not in global_args:
@@ -106,7 +166,8 @@ class CommandMixin:
         if global_args:
             args = global_args + args
 
-        args = ["-P", self.get_destination_path()] + args
+        if is_download:
+            args = ["-P", self.get_destination_path()] + args
 
         ffmpeg_path = self.get_ffmpeg_path()
         if ffmpeg_path and ffmpeg_path != "ffmpeg":
@@ -119,13 +180,23 @@ class CommandMixin:
         if is_video:
             match = re.search(r"(\d+)x(\d+)", text)
             if match:
-                return f"{match.group(2)}p"
+                short_side = min(int(match.group(1)), int(match.group(2)))
+                return f"{short_side}p"
             return "video"
 
         match = re.search(r"\b(mp3|m4a|webm|opus|aac|ogg|flac|wav)\b", text, re.IGNORECASE)
         if match:
             return match.group(1).lower()
         return "audio"
+
+    def _is_muxed_format(self, format_id: str) -> bool:
+        """Return True if format_id is a known combined video+audio format."""
+        fmt = self.format_data.get(format_id) if hasattr(self, "format_data") else None
+        if not isinstance(fmt, dict):
+            return False
+        vcodec = fmt.get("vcodec") or "none"
+        acodec = fmt.get("acodec") or "none"
+        return vcodec != "none" and acodec != "none"
 
     def build_selected_download_args(self):
         """Return download args, format id, and display label for the current selection."""
@@ -155,6 +226,16 @@ class CommandMixin:
             elif audio_id == "none":
                 format_id = video_id if video_id else "bestvideo"
                 format_display = "video only"
+            elif (
+                video_id
+                and self._is_muxed_format(video_id)
+                and audio_id in ("", "bestaudio", None)
+            ):
+                format_id = video_id
+                format_display = self.extract_simple_format_display(video_text, is_video=True)
+            elif video_id == "bestvideo" and audio_id == "bestaudio":
+                format_id = "bv*+ba/b"
+                format_display = "best+audio"
             elif video_id and audio_id:
                 format_id = f"{video_id}+{audio_id}"
                 video_part = (
@@ -183,18 +264,35 @@ class CommandMixin:
                     else self.extract_simple_format_display(audio_text, is_video=False)
                 )
             else:
-                format_id = "best"
+                format_id = "bv*+ba/b"
                 format_display = "best"
 
         args = ["-f", format_id]
 
-        if video_id == "none" and not manual_format:
-            args.extend(["-x", "--audio-format", "mp3"])
+        custom_args = self.get_custom_options_args()
+        if "--yes-playlist" not in custom_args and "--no-playlist" not in custom_args:
+            args.append("--no-playlist")
 
-        self.add_subtitle_args(args)
+        is_audio_only = video_id == "none" and not manual_format
+        if is_audio_only:
+            audio_format = (
+                self.audio_format_combo.currentData()
+                if hasattr(self, "audio_format_combo")
+                else "original"
+            )
+            if audio_format and audio_format != "original":
+                args.extend(["-x", "--audio-format", audio_format])
+
+        self.add_subtitle_args(args, embed=not is_audio_only)
 
         if "+" in format_id:
-            args.extend(["--merge-output-format", "mp4"])
+            video_container = (
+                self.video_container_combo.currentData()
+                if hasattr(self, "video_container_combo")
+                else "mp4"
+            )
+            if video_container and video_container != "original":
+                args.extend(["--merge-output-format", video_container])
 
         return args, format_id, format_display
 
@@ -225,10 +323,4 @@ class CommandMixin:
         if has_dynamic_part:
             return "Partial" if total_bytes and has_known_part else "Dynamic"
 
-        if total_bytes == 0:
-            return "Unknown"
-        if total_bytes > 1024 * 1024 * 1024:
-            return f"{total_bytes / (1024**3):.1f} GB"
-        if total_bytes > 1024 * 1024:
-            return f"{total_bytes / (1024**2):.0f} MB"
-        return f"{total_bytes / 1024:.0f} KB"
+        return format_filesize(total_bytes, compact=False)

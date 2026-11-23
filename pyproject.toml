@@ -6,7 +6,7 @@ extension-pkg-allow-list = ["PySide6"]
 # Pylint models native Qt signals as methods. Limit the exception to the
 # signal names and signal operations used here; ordinary members stay checked.
 generated-members = [
-    '.*\.(timeout|clicked|currentIndexChanged|stateChanged|buttonClicked|finished|textChanged|aboutToQuit)\.(connect|disconnect|emit)$',
+    '.*\.(timeout|clicked|currentChanged|currentIndexChanged|stateChanged|buttonClicked|finished|textChanged|aboutToQuit)\.(connect|disconnect|emit)$',
 ]
 
 [tool.pylint.classes]

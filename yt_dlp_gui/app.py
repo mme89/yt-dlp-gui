@@ -5,31 +5,38 @@ This application provides an easy-to-use graphical interface for downloading vid
 without using the command line.
 """
 
-# The existing main window keeps its UI layout and event wiring in one module.
 # pylint: disable=too-many-lines
-import os
-import sys
+from collections import deque
 import json
-import re
-import shutil
-import shlex
-import subprocess
+import sys
 from pathlib import Path
-from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QLineEdit, QPushButton, QComboBox, QTextEdit, QTabWidget,
-    QGroupBox, QCheckBox, QFileDialog, QMessageBox, QProgressBar, QSizePolicy,
-    QTableWidget, QTableWidgetItem, QHeaderView, QScrollArea, QFrame, QGridLayout
-)
-from PySide6.QtCore import Qt, QProcess, QUrl, QTimer, QRegularExpression, QStandardPaths
-from PySide6.QtGui import (
-    QFont, QPixmap, QColor, QIcon, QRegularExpressionValidator, QDesktopServices
-)
-from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
+from urllib.parse import urlparse
 
-from .commands import CommandMixin
-from .compatibility import RECOMMENDED_YTDLP_VERSION, is_supported_runtime, needs_ytdlp_update
-from .process_utils import hidden_subprocess_kwargs
+from PySide6.QtCore import Qt, QStandardPaths, QTimer, QUrl
+from PySide6.QtGui import QColor, QDesktopServices, QIcon, QPixmap, QTextCursor
+from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
+from PySide6.QtWidgets import (
+    QApplication,
+    QFileDialog,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QTableWidgetItem,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+from .commands import CommandMixin, build_output_template, split_cli_args
+from .formatters import extract_video_metadata, format_duration, parse_video_formats
+from .probes import ProbeMixin
+from .queue_controller import QueueMixin
+from .tabs import TabsMixin
 from .terminal_window import TerminalWindow
 from .updates import UpdateChecker
 from .version import APP_VERSION
@@ -37,55 +44,62 @@ from .workers import DownloadThread, FormatFetcher
 
 
 APP_ROOT = Path(__file__).resolve().parent.parent
+RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", APP_ROOT))
+EXECUTABLE_DIR = (
+    Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else APP_ROOT
+)
 
 
-class YtDlpGUI(CommandMixin, QMainWindow):
+class YtDlpGUI(ProbeMixin, CommandMixin, TabsMixin, QueueMixin, QMainWindow):
     """Main window coordinating downloads, settings, and background workers."""
+
     COLORS = {
-        'background': '#f5f5f5',
-        'surface': '#ffffff',
-        'primary': '#2196F3',
-        'primary_dark': '#1976D2',
-        'primary_light': '#BBDEFB',
-
-        'text_primary': '#212121',
-        'text_secondary': '#757575',
-        'text_disabled': '#BDBDBD',
-
-        'success': '#4CAF50',
-        'error': '#F44336',
-        'warning': '#FF9800',
-        'info': '#2196F3',
-
-        'border': '#E0E0E0',
-        'border_focus': '#2196F3',
-        'hover': '#E3F2FD',
-        'pressed': '#BBDEFB',
-
-        'thumbnail_bg': '#EEEEEE',
-        'input_bg': '#FFFFFF',
-        'button_bg': '#FAFAFA',
-        'button_text': '#212121',
+        "background": "#f5f5f5",
+        "surface": "#ffffff",
+        "primary": "#2196F3",
+        "primary_dark": "#1976D2",
+        "primary_light": "#BBDEFB",
+        "text_primary": "#212121",
+        "text_secondary": "#757575",
+        "text_disabled": "#BDBDBD",
+        "success": "#4CAF50",
+        "error": "#F44336",
+        "warning": "#FF9800",
+        "info": "#2196F3",
+        "border": "#E0E0E0",
+        "border_focus": "#2196F3",
+        "hover": "#E3F2FD",
+        "pressed": "#BBDEFB",
+        "thumbnail_bg": "#EEEEEE",
+        "input_bg": "#FFFFFF",
+        "button_bg": "#FAFAFA",
+        "button_text": "#212121",
     }
 
     def __init__(self):
         """Initialize application state, build the interface, and schedule update checks."""
         super().__init__()
-        self.legacy_config_file = APP_ROOT / "settings.json"
+        self.legacy_config_file = EXECUTABLE_DIR / "settings.json"
         self.config_file = self.get_config_file_path()
         self.format_fetcher = None
         self.playlist_fetcher = None
         self.download_thread = None
+        self._worker_threads = set()
+        self._probe_workers = {}
+        self.analyzed_url = None
+        self.loaded_playlist_url = None
         self.video_formats = []
         self.audio_formats = []
         self.subtitles = {}
         self.automatic_captions = {}
         self.terminal_window = None
+        self._terminal_buffer = deque(maxlen=2000)
         self.ytdlp_version = None
         self.ffmpeg_version = None
         self.js_runtime_version = None
         self.js_runtime_info = None
         self.js_runtime_cache_dirty = True
+        self._dependency_status_dirty = False
         self.ytdlp_ejs_status = None
         self.download_queue = []
         self.is_processing_queue = False
@@ -106,9 +120,9 @@ class YtDlpGUI(CommandMixin, QMainWindow):
         self.apply_stylesheet()
         self.load_settings()
         self.setup_settings_autosave()
-        self.check_ytdlp_version()
-        self.check_ffmpeg_version()
-        self.check_js_runtime_version()
+        self.check_ytdlp_version(async_mode=True)
+        self.check_ffmpeg_version(async_mode=True)
+        self.check_js_runtime_version(async_mode=True)
         self.check_ytdlp_ejs_status()
         self.update_startup_timer = QTimer(self)
         self.update_startup_timer.setSingleShot(True)
@@ -119,267 +133,21 @@ class YtDlpGUI(CommandMixin, QMainWindow):
         self.update_timer.timeout.connect(self.check_for_updates)
         self.update_timer.start()
 
-    def apply_stylesheet(self):
-        """Apply consistent stylesheet across all platforms"""
-        stylesheet = f"""
-            QMainWindow {{
-                background-color: {self.COLORS['background']};
-            }}
-
-            QWidget {{
-                background-color: {self.COLORS['background']};
-                color: {self.COLORS['text_primary']};
-                font-family: ".AppleSystemUIFont", "Segoe UI", Helvetica, Arial, sans-serif;
-                font-size: 13px;
-            }}
-
-            QGroupBox {{
-                background-color: {self.COLORS['surface']};
-                border: 1px solid {self.COLORS['border']};
-                border-radius: 6px;
-                margin-top: 4px;
-                padding-top: 4px;
-                font-weight: bold;
-                color: {self.COLORS['text_primary']};
-            }}
-
-            QGroupBox::title {{
-                subcontrol-origin: margin;
-                subcontrol-position: top left;
-                left: 10px;
-                padding: 0 5px;
-                background-color: {self.COLORS['surface']};
-            }}
-
-            QLineEdit {{
-                background-color: {self.COLORS['input_bg']};
-                border: 1px solid {self.COLORS['border']};
-                border-radius: 4px;
-                padding: 6px 8px;
-                color: {self.COLORS['text_primary']};
-                selection-background-color: {self.COLORS['primary_light']};
-            }}
-
-            QLineEdit:focus {{
-                border: 2px solid {self.COLORS['border_focus']};
-                padding: 5px 7px;
-            }}
-
-            QLineEdit:disabled {{
-                background-color: {self.COLORS['background']};
-                color: {self.COLORS['text_disabled']};
-            }}
-
-            QPushButton {{
-                background-color: {self.COLORS['button_bg']};
-                border: 1px solid {self.COLORS['border']};
-                border-radius: 4px;
-                padding: 6px 16px;
-                color: {self.COLORS['button_text']};
-                font-weight: 500;
-            }}
-
-            QPushButton:hover {{
-                background-color: {self.COLORS['hover']};
-                border-color: {self.COLORS['primary']};
-            }}
-
-            QPushButton:pressed {{
-                background-color: {self.COLORS['pressed']};
-            }}
-
-            QPushButton:disabled {{
-                background-color: {self.COLORS['background']};
-                color: {self.COLORS['text_disabled']};
-                border-color: {self.COLORS['border']};
-            }}
-
-            QComboBox {{
-                background-color: {self.COLORS['input_bg']};
-                border: 1px solid {self.COLORS['border']};
-                border-radius: 4px;
-                color: {self.COLORS['text_primary']};
-            }}
-
-            QComboBox:focus {{
-                border: 2px solid {self.COLORS['border_focus']};
-            }}
-
-            QComboBox::drop-down {{
-                border: none;
-                width: 20px;
-            }}
-
-            QComboBox QAbstractItemView {{
-                background-color: {self.COLORS['surface']};
-                border: 1px solid {self.COLORS['border']};
-                selection-background-color: {self.COLORS['primary_light']};
-                selection-color: {self.COLORS['text_primary']};
-                outline: none;
-            }}
-
-            QTextEdit {{
-                background-color: {self.COLORS['surface']};
-                border: 1px solid {self.COLORS['border']};
-                border-radius: 4px;
-                padding: 8px;
-                color: {self.COLORS['text_primary']};
-                selection-background-color: {self.COLORS['primary_light']};
-            }}
-
-            QTableWidget {{
-                background-color: {self.COLORS['surface']};
-                border: 1px solid {self.COLORS['border']};
-                border-radius: 4px;
-                gridline-color: {self.COLORS['border']};
-                color: {self.COLORS['text_primary']};
-            }}
-
-            QTableWidget::item {{
-                padding: 4px;
-            }}
-
-            QTableWidget::item:selected {{
-                background-color: {self.COLORS['primary_light']};
-                color: {self.COLORS['text_primary']};
-            }}
-
-            QHeaderView::section {{
-                background-color: {self.COLORS['button_bg']};
-                border: none;
-                border-right: 1px solid {self.COLORS['border']};
-                border-bottom: 1px solid {self.COLORS['border']};
-                padding: 6px;
-                font-weight: bold;
-                color: {self.COLORS['text_primary']};
-            }}
-
-            QTabWidget::pane {{
-                border: 1px solid {self.COLORS['border']};
-                border-radius: 4px;
-                background-color: {self.COLORS['surface']};
-                top: -1px;
-            }}
-
-            QTabBar::tab {{
-                background-color: {self.COLORS['button_bg']};
-                border: 1px solid {self.COLORS['border']};
-                border-bottom: none;
-                border-top-left-radius: 4px;
-                border-top-right-radius: 4px;
-                padding: 8px 16px;
-                margin-right: 2px;
-                color: {self.COLORS['text_secondary']};
-            }}
-
-            QTabBar::tab:selected {{
-                background-color: {self.COLORS['surface']};
-                color: {self.COLORS['primary']};
-                font-weight: bold;
-            }}
-
-            QTabBar::tab:hover {{
-                background-color: {self.COLORS['hover']};
-            }}
-
-            QProgressBar {{
-                border: 1px solid {self.COLORS['border']};
-                border-radius: 4px;
-                text-align: center;
-                background-color: {self.COLORS['background']};
-                color: {self.COLORS['text_primary']};
-            }}
-
-            QProgressBar::chunk {{
-                background-color: {self.COLORS['primary']};
-                border-radius: 3px;
-            }}
-
-            QCheckBox {{
-                color: {self.COLORS['text_primary']};
-                spacing: 6px;
-            }}
-
-            QCheckBox::indicator {{
-                width: 18px;
-                height: 18px;
-                border: 1px solid {self.COLORS['border']};
-                border-radius: 3px;
-                background-color: {self.COLORS['input_bg']};
-            }}
-
-            QCheckBox::indicator:checked {{
-                background-color: {self.COLORS['primary']};
-                border-color: {self.COLORS['primary']};
-            }}
-
-            QLabel {{
-                color: {self.COLORS['text_primary']};
-                background-color: transparent;
-            }}
-
-            QStatusBar {{
-                background-color: {self.COLORS['surface']};
-                border-top: 1px solid {self.COLORS['border']};
-                color: {self.COLORS['text_secondary']};
-            }}
-
-            QScrollBar:vertical {{
-                border: none;
-                background-color: {self.COLORS['background']};
-                width: 12px;
-                margin: 0;
-            }}
-
-            QScrollBar::handle:vertical {{
-                background-color: {self.COLORS['text_disabled']};
-                border-radius: 6px;
-                min-height: 20px;
-            }}
-
-            QScrollBar::handle:vertical:hover {{
-                background-color: {self.COLORS['text_secondary']};
-            }}
-
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
-                height: 0px;
-            }}
-
-            QScrollBar:horizontal {{
-                border: none;
-                background-color: {self.COLORS['background']};
-                height: 12px;
-                margin: 0;
-            }}
-
-            QScrollBar::handle:horizontal {{
-                background-color: {self.COLORS['text_disabled']};
-                border-radius: 6px;
-                min-width: 20px;
-            }}
-
-            QScrollBar::handle:horizontal:hover {{
-                background-color: {self.COLORS['text_secondary']};
-            }}
-
-            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
-                width: 0px;
-            }}
-        """
-        self.setStyleSheet(stylesheet)
-
     def setup_logo(self):
-        """Setup window icon and logo display"""
-        logo_path = APP_ROOT / "assets" / "logo.png"
+        """Setup window icon and logo display."""
+        logo_path = RESOURCE_ROOT / "assets" / "logo.png"
         if logo_path.exists():
             self.setWindowIcon(QIcon(str(logo_path)))
 
             logo_pixmap = QPixmap(str(logo_path))
-            self.about_logo_label.setPixmap(logo_pixmap.scaled(
-                self.about_logo_label.width(), self.about_logo_label.height(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation
-            ))
+            self.about_logo_label.setPixmap(
+                logo_pixmap.scaled(
+                    self.about_logo_label.width(),
+                    self.about_logo_label.height(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
 
     def init_ui(self):
         """Build the main window, URL controls, and feature tabs."""
@@ -399,8 +167,12 @@ class YtDlpGUI(CommandMixin, QMainWindow):
         self.url_input.setPlaceholderText("https://www.youtube.com/watch?v=...")
         self.analyze_btn = QPushButton("Analyze")
         self.analyze_btn.clicked.connect(self.fetch_formats)
+        self.cancel_analyze_btn = QPushButton("Cancel")
+        self.cancel_analyze_btn.setEnabled(False)
+        self.cancel_analyze_btn.clicked.connect(self.cancel_analyze)
         url_layout.addWidget(self.url_input)
         url_layout.addWidget(self.analyze_btn)
+        url_layout.addWidget(self.cancel_analyze_btn)
         url_main_layout.addLayout(url_layout)
 
         thumbnail_info_layout = QHBoxLayout()
@@ -427,12 +199,15 @@ class YtDlpGUI(CommandMixin, QMainWindow):
         self.upload_date_label = QLabel("Uploaded: -")
         self.views_label = QLabel("Views: -")
         self.likes_label = QLabel("Likes: -")
-        info_layout.addWidget(self.title_label)
-        info_layout.addWidget(self.duration_label)
-        info_layout.addWidget(self.uploader_label)
-        info_layout.addWidget(self.upload_date_label)
-        info_layout.addWidget(self.views_label)
-        info_layout.addWidget(self.likes_label)
+        for label in (
+            self.title_label,
+            self.duration_label,
+            self.uploader_label,
+            self.upload_date_label,
+            self.views_label,
+            self.likes_label,
+        ):
+            info_layout.addWidget(label)
         info_layout.addStretch()
         thumbnail_info_layout.addWidget(info_widget)
 
@@ -441,617 +216,17 @@ class YtDlpGUI(CommandMixin, QMainWindow):
         main_layout.addWidget(url_group)
 
         self.tabs = QTabWidget()
+        self.tabs.currentChanged.connect(self.on_tab_changed)
         main_layout.addWidget(self.tabs)
 
         self.create_download_tab()
-
         self.create_queue_tab()
-
         self.create_playlist_tab()
-
         self.create_advanced_tab()
-
         self.create_options_tab()
-
         self.create_about_tab()
 
         self.statusBar().showMessage("Ready")
-
-    def create_download_tab(self):
-        """Build format selection, subtitle controls, and download actions."""
-        download_widget = QWidget()
-        layout = QVBoxLayout(download_widget)
-
-        video_group = QGroupBox("Video Format")
-        video_layout = QVBoxLayout()
-        self.video_combo = QComboBox()
-        self.video_combo.addItem("Fetch formats first...", "")
-        video_layout.addWidget(self.video_combo)
-        video_group.setLayout(video_layout)
-        layout.addWidget(video_group)
-
-        audio_group = QGroupBox("Audio Format")
-        audio_layout = QVBoxLayout()
-        self.audio_combo = QComboBox()
-        self.audio_combo.addItem("Fetch formats first...", "")
-        audio_layout.addWidget(self.audio_combo)
-        audio_group.setLayout(audio_layout)
-        layout.addWidget(audio_group)
-
-        subtitle_group = QGroupBox("Subtitles")
-        subtitle_layout = QVBoxLayout()
-        subtitle_row_layout = QHBoxLayout()
-        self.subtitle_combo = QComboBox()
-        self.subtitle_combo.addItem("None", "")
-        self.subtitle_combo.addItem("English", "en")
-        self.subtitle_combo.addItem("All subtitles", "all")
-        self.subtitle_combo.currentIndexChanged.connect(self.update_subtitle_option_states)
-        subtitle_row_layout.addWidget(self.subtitle_combo, 1)
-
-        self.include_live_chat_checkbox = QCheckBox("Include live chat")
-        self.include_live_chat_checkbox.setEnabled(False)
-        subtitle_row_layout.addWidget(self.include_live_chat_checkbox)
-
-        self.keep_subtitle_files_checkbox = QCheckBox("Keep subtitle files")
-        self.keep_subtitle_files_checkbox.setEnabled(False)
-        subtitle_row_layout.addWidget(self.keep_subtitle_files_checkbox)
-
-        subtitle_layout.addLayout(subtitle_row_layout)
-
-        subtitle_help = QLabel(
-            'By default, subtitles are embedded into the downloaded media. '
-            'Enable "Keep subtitle files" to also save separate subtitle files.'
-        )
-        subtitle_help.setWordWrap(True)
-        subtitle_help.setStyleSheet(f"color: {self.COLORS['text_secondary']}; font-size: 10pt;")
-        subtitle_layout.addWidget(subtitle_help)
-
-        subtitle_group.setLayout(subtitle_layout)
-        layout.addWidget(subtitle_group)
-
-        manual_group = QGroupBox("Or enter format manually (overrides dropdowns)")
-        manual_layout = QVBoxLayout()
-        self.format_input = QLineEdit()
-        self.format_input.setPlaceholderText("e.g., 137+140 or leave empty")
-        manual_layout.addWidget(self.format_input)
-        manual_group.setLayout(manual_layout)
-        layout.addWidget(manual_group)
-
-        download_btn_layout = QHBoxLayout()
-        self.download_btn = QPushButton("Download Now")
-        self.download_btn.clicked.connect(self.download_video)
-        self.add_to_queue_btn = QPushButton("Add to Queue")
-        self.add_to_queue_btn.clicked.connect(self.add_to_queue)
-        download_btn_layout.addWidget(self.download_btn)
-        download_btn_layout.addWidget(self.add_to_queue_btn)
-        layout.addLayout(download_btn_layout)
-
-        self.download_page_status_label = QLabel("Enter a URL and click Analyze")
-        self.download_page_status_label.setMinimumHeight(24)
-        self.download_page_status_label.setStyleSheet(f"color: {self.COLORS['text_secondary']};")
-        layout.addWidget(self.download_page_status_label)
-
-        progress_group = QGroupBox("Download Progress")
-        progress_layout = QVBoxLayout()
-        progress_layout.setContentsMargins(12, 18, 12, 12)
-        progress_layout.setSpacing(8)
-        progress_group.setFixedHeight(115)
-        progress_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setFixedHeight(20)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setTextVisible(False)
-        progress_layout.addWidget(self.progress_bar)
-
-        self.status_label = QLabel("")
-        self.status_label.setSizePolicy(
-            QSizePolicy.Policy.Expanding,
-            QSizePolicy.Policy.Preferred,
-        )
-
-        self.abort_btn = QPushButton("Abort Download")
-        self.abort_btn.clicked.connect(self.abort_download)
-        self.abort_btn.setEnabled(False)
-        self.abort_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {self.COLORS['error']};
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 6px 16px;
-                font-weight: 500;
-            }}
-            QPushButton:hover {{
-                background-color: #D32F2F;
-            }}
-            QPushButton:pressed {{
-                background-color: #C62828;
-            }}
-            QPushButton:disabled {{
-                background-color: {self.COLORS['text_disabled']};
-            }}
-        """)
-        self.abort_btn.setMinimumWidth(self.abort_btn.sizeHint().width() + 20)
-        self.abort_btn.setFixedHeight(34)
-        self.abort_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-
-        progress_status_layout = QHBoxLayout()
-        progress_status_layout.setContentsMargins(0, 0, 0, 0)
-        progress_status_layout.setSpacing(12)
-        progress_status_layout.addWidget(self.status_label, 1)
-        progress_status_layout.addWidget(self.abort_btn)
-        progress_layout.addLayout(progress_status_layout)
-
-        progress_group.setLayout(progress_layout)
-        layout.addWidget(progress_group)
-        layout.addStretch()
-
-        self.tabs.addTab(download_widget, "Download")
-
-    def create_playlist_tab(self):
-        """Build playlist loading and selective download controls."""
-        playlist_widget = QWidget()
-        layout = QVBoxLayout(playlist_widget)
-
-        btn_layout = QHBoxLayout()
-        self.list_playlist_btn = QPushButton("Load Playlist")
-        self.list_playlist_btn.clicked.connect(self.load_playlist_items)
-        self.download_playlist_btn = QPushButton("Download Checked")
-        self.download_playlist_btn.clicked.connect(self.download_playlist)
-        self.download_playlist_btn.setEnabled(False)
-        self.check_all_playlist_btn = QPushButton("Check All")
-        self.check_all_playlist_btn.clicked.connect(self.check_all_playlist)
-        self.check_all_playlist_btn.setEnabled(False)
-        self.uncheck_all_playlist_btn = QPushButton("Uncheck All")
-        self.uncheck_all_playlist_btn.clicked.connect(self.uncheck_all_playlist)
-        self.uncheck_all_playlist_btn.setEnabled(False)
-        btn_layout.addWidget(self.list_playlist_btn)
-        btn_layout.addWidget(self.download_playlist_btn)
-        btn_layout.addWidget(self.check_all_playlist_btn)
-        btn_layout.addWidget(self.uncheck_all_playlist_btn)
-        btn_layout.addStretch()
-
-        quality_label = QLabel("Quality:")
-        btn_layout.addWidget(quality_label)
-        self.playlist_quality_combo = QComboBox()
-        self.playlist_quality_combo.addItem("Best", "best")
-        self.playlist_quality_combo.addItem("2160p (4K)", "2160")
-        self.playlist_quality_combo.addItem("1440p (2K)", "1440")
-        self.playlist_quality_combo.addItem("1080p (Full HD)", "1080")
-        self.playlist_quality_combo.addItem("720p (HD)", "720")
-        self.playlist_quality_combo.addItem("480p", "480")
-        self.playlist_quality_combo.addItem("360p", "360")
-        self.playlist_quality_combo.setCurrentIndex(3)
-        btn_layout.addWidget(self.playlist_quality_combo)
-
-        layout.addLayout(btn_layout)
-
-        self.playlist_table = QTableWidget()
-        self.playlist_table.setColumnCount(5)
-        self.playlist_table.setHorizontalHeaderLabels(
-            ["", "Status", "Title", "Duration", "Uploader"]
-        )
-        self.playlist_table.setColumnWidth(0, 30)
-        self.playlist_table.setColumnWidth(1, 100)
-        self.playlist_table.setColumnWidth(3, 80)
-        self.playlist_table.setColumnWidth(4, 250)
-        self.playlist_table.horizontalHeader().setSectionResizeMode(
-            2, QHeaderView.ResizeMode.Stretch
-        )
-        self.playlist_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.playlist_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        layout.addWidget(self.playlist_table)
-
-        self.playlist_status_label = QLabel("Enter a playlist URL and click 'Load Playlist'")
-        self.playlist_status_label.setStyleSheet(f"color: {self.COLORS['text_secondary']};")
-        layout.addWidget(self.playlist_status_label)
-
-        self.tabs.addTab(playlist_widget, "Playlist")
-
-    def create_queue_tab(self):
-        """Build the download queue table and processing controls."""
-        queue_widget = QWidget()
-        layout = QVBoxLayout(queue_widget)
-
-        btn_layout = QHBoxLayout()
-        self.start_queue_btn = QPushButton("Start Queue")
-        self.start_queue_btn.clicked.connect(self.start_queue_processing)
-        self.start_queue_btn.setEnabled(False)
-        self.stop_queue_btn = QPushButton("Stop Queue")
-        self.stop_queue_btn.clicked.connect(self.stop_queue_processing)
-        self.stop_queue_btn.setEnabled(False)
-        self.clear_queue_btn = QPushButton("Clear Queue")
-        self.clear_queue_btn.clicked.connect(self.clear_queue)
-        self.remove_selected_btn = QPushButton("Remove Selected")
-        self.remove_selected_btn.clicked.connect(self.remove_selected_from_queue)
-        btn_layout.addWidget(self.start_queue_btn)
-        btn_layout.addWidget(self.stop_queue_btn)
-        btn_layout.addWidget(self.remove_selected_btn)
-        btn_layout.addWidget(self.clear_queue_btn)
-        btn_layout.addStretch()
-        layout.addLayout(btn_layout)
-
-        self.queue_table = QTableWidget()
-        self.queue_table.setColumnCount(6)
-        self.queue_table.setHorizontalHeaderLabels(
-            ["#", "Status", "URL", "Title", "Format", "Size"]
-        )
-        self.queue_table.setColumnWidth(0, 40)
-        self.queue_table.setColumnWidth(1, 100)
-        self.queue_table.setColumnWidth(4, 100)
-        self.queue_table.setColumnWidth(5, 80)
-        self.queue_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.queue_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        self.queue_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.queue_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.queue_table.verticalHeader().setVisible(False)
-        layout.addWidget(self.queue_table)
-
-        self.queue_status_label = QLabel("Queue is empty. Add videos from the Download tab.")
-        self.queue_status_label.setStyleSheet(f"color: {self.COLORS['text_secondary']};")
-        layout.addWidget(self.queue_status_label)
-
-        self.tabs.addTab(queue_widget, "Queue")
-
-    def create_advanced_tab(self):
-        """Build custom command and metadata inspection controls."""
-        advanced_widget = QWidget()
-        layout = QVBoxLayout(advanced_widget)
-
-        custom_group = QGroupBox("Custom yt-dlp arguments")
-        custom_layout = QVBoxLayout()
-        self.custom_input = QLineEdit()
-        self.custom_input.setPlaceholderText(
-            "Arguments only; URL comes from the YouTube URL field"
-        )
-        self.custom_input.setToolTip(
-            "Enter yt-dlp options only. The URL is appended automatically."
-        )
-        custom_layout.addWidget(self.custom_input)
-        custom_group.setLayout(custom_layout)
-        layout.addWidget(custom_group)
-
-        btn_layout = QHBoxLayout()
-        self.execute_custom_btn = QPushButton("Execute Custom")
-        self.execute_custom_btn.clicked.connect(self.execute_custom)
-        self.metadata_btn = QPushButton("Get Metadata")
-        self.metadata_btn.clicked.connect(self.get_metadata)
-        self.list_subs_btn = QPushButton("List Subtitles")
-        self.list_subs_btn.clicked.connect(self.list_subtitles)
-        btn_layout.addWidget(self.execute_custom_btn)
-        btn_layout.addWidget(self.metadata_btn)
-        btn_layout.addWidget(self.list_subs_btn)
-        layout.addLayout(btn_layout)
-
-        self.advanced_output = QTextEdit()
-        self.advanced_output.setReadOnly(True)
-        self.advanced_output.setFont(QFont("Menlo", 10))
-        layout.addWidget(self.advanced_output)
-
-        self.tabs.addTab(advanced_widget, "Advanced")
-
-    def create_options_tab(self):
-        """Build settings for tool paths, download rates, and output preferences."""
-        options_widget = QWidget()
-        layout = QVBoxLayout(options_widget)
-        layout.setSpacing(0)
-
-        custom_opts_label = QLabel("Custom yt-dlp options (applied to all operations):")
-        layout.addWidget(custom_opts_label)
-        layout.addSpacing(3)
-        self.custom_options_input = QLineEdit()
-        self.custom_options_input.setMinimumHeight(20)
-        self.custom_options_input.setPlaceholderText("e.g., --cookies /path/to/cookies.txt")
-        layout.addWidget(self.custom_options_input)
-
-        layout.addSpacing(10)
-
-        dest_label = QLabel("Download destination (leave empty for system Downloads folder):")
-        layout.addWidget(dest_label)
-        layout.addSpacing(3)
-        dest_input_layout = QHBoxLayout()
-        dest_input_layout.setContentsMargins(0, 0, 0, 0)
-        dest_input_layout.setSpacing(6)
-        self.destination_input = QLineEdit()
-        self.destination_input.setMinimumHeight(20)
-        self.destination_input.setPlaceholderText("System Downloads folder or /path/to/folder")
-        self.browse_btn = QPushButton("Browse...")
-        self.browse_btn.clicked.connect(self.browse_destination)
-        dest_input_layout.addWidget(self.destination_input)
-        dest_input_layout.addWidget(self.browse_btn)
-        layout.addLayout(dest_input_layout)
-
-        layout.addSpacing(10)
-
-        paths_group = QGroupBox("Binary Paths")
-        paths_group_layout = QVBoxLayout()
-        paths_group_layout.setSpacing(0)
-        paths_group_layout.setContentsMargins(10, 10, 10, 2)
-
-        paths_layout = QHBoxLayout()
-        paths_layout.setSpacing(6)
-        paths_layout.setContentsMargins(0, 0, 0, 0)
-
-        ytdlp_layout = QVBoxLayout()
-        ytdlp_layout.setSpacing(0)
-        ytdlp_path_label = QLabel("yt-dlp path:")
-        ytdlp_layout.addWidget(ytdlp_path_label)
-        ytdlp_layout.addSpacing(3)
-        ytdlp_path_input_layout = QHBoxLayout()
-        ytdlp_path_input_layout.setContentsMargins(0, 0, 0, 0)
-        ytdlp_path_input_layout.setSpacing(6)
-        self.ytdlp_path_input = QLineEdit()
-        self.ytdlp_path_input.setMinimumHeight(20)
-        self.ytdlp_path_input.setMaximumWidth(400)
-        self.ytdlp_path_input.setPlaceholderText("/usr/local/bin/yt-dlp")
-        self.browse_ytdlp_btn = QPushButton("Browse...")
-        self.browse_ytdlp_btn.clicked.connect(self.browse_ytdlp_path)
-        ytdlp_path_input_layout.addWidget(self.ytdlp_path_input)
-        ytdlp_path_input_layout.addWidget(self.browse_ytdlp_btn)
-        ytdlp_layout.addLayout(ytdlp_path_input_layout)
-        paths_layout.addLayout(ytdlp_layout)
-
-        ffmpeg_layout = QVBoxLayout()
-        ffmpeg_layout.setSpacing(0)
-        ffmpeg_label = QLabel("FFmpeg path:")
-        ffmpeg_layout.addWidget(ffmpeg_label)
-        ffmpeg_layout.addSpacing(3)
-        ffmpeg_path_input_layout = QHBoxLayout()
-        ffmpeg_path_input_layout.setContentsMargins(0, 0, 0, 0)
-        ffmpeg_path_input_layout.setSpacing(6)
-        self.ffmpeg_path_input = QLineEdit()
-        self.ffmpeg_path_input.setMinimumHeight(20)
-        self.ffmpeg_path_input.setMaximumWidth(400)
-        self.ffmpeg_path_input.setPlaceholderText("/usr/local/bin/ffmpeg")
-        self.browse_ffmpeg_btn = QPushButton("Browse...")
-        self.browse_ffmpeg_btn.clicked.connect(self.browse_ffmpeg_path)
-        ffmpeg_path_input_layout.addWidget(self.ffmpeg_path_input)
-        ffmpeg_path_input_layout.addWidget(self.browse_ffmpeg_btn)
-        ffmpeg_layout.addLayout(ffmpeg_path_input_layout)
-        paths_layout.addLayout(ffmpeg_layout)
-
-        paths_group_layout.addLayout(paths_layout)
-
-        path_help = QLabel("Leave empty for system default")
-        path_help.setStyleSheet(f"color: {self.COLORS['text_secondary']}; font-size: 10pt;")
-        paths_group_layout.addWidget(path_help)
-
-        paths_group.setLayout(paths_group_layout)
-        layout.addWidget(paths_group)
-
-        layout.addSpacing(10)
-
-        rates_group = QGroupBox("Download Rate Limits")
-        rates_group_layout = QVBoxLayout()
-        rates_group_layout.setSpacing(0)
-        rates_group_layout.setContentsMargins(10, 10, 10, 2)
-
-        rates_layout = QHBoxLayout()
-        rates_layout.setSpacing(6)
-        rates_layout.setContentsMargins(0, 0, 0, 0)
-        rate_validator = QRegularExpressionValidator(
-            QRegularExpression(r"^\d+(?:\.\d+)?[KMGkmg]?$"),
-            self,
-        )
-
-        max_rate_layout = QVBoxLayout()
-        max_rate_layout.setSpacing(0)
-        limit_rate_label = QLabel("Maximum download rate:")
-        max_rate_layout.addWidget(limit_rate_label)
-        max_rate_layout.addSpacing(3)
-        self.limit_rate_input = QLineEdit()
-        self.limit_rate_input.setMinimumHeight(20)
-        self.limit_rate_input.setMaximumWidth(160)
-        self.limit_rate_input.setPlaceholderText("e.g., 50K, 4.2M, 1G")
-        self.limit_rate_input.setValidator(rate_validator)
-        max_rate_layout.addWidget(self.limit_rate_input)
-        rates_layout.addLayout(max_rate_layout)
-
-        rates_layout.addSpacing(20)
-
-        min_rate_layout = QVBoxLayout()
-        min_rate_layout.setSpacing(0)
-        throttled_rate_label = QLabel("Minimum download rate:")
-        min_rate_layout.addWidget(throttled_rate_label)
-        min_rate_layout.addSpacing(3)
-        self.throttled_rate_input = QLineEdit()
-        self.throttled_rate_input.setMinimumHeight(20)
-        self.throttled_rate_input.setMaximumWidth(160)
-        self.throttled_rate_input.setPlaceholderText("e.g., 100K, 1M")
-        self.throttled_rate_input.setValidator(rate_validator)
-        min_rate_layout.addWidget(self.throttled_rate_input)
-        rates_layout.addLayout(min_rate_layout)
-
-        rates_layout.addStretch()
-
-        rates_group_layout.addLayout(rates_layout)
-        rates_group_layout.addSpacing(1)
-
-        rate_help = QLabel("Leave empty for unlimited. K=kilobytes/s, M=megabytes/s, G=gigabytes/s")
-        rate_help.setStyleSheet(f"color: {self.COLORS['text_secondary']}; font-size: 10pt;")
-        rates_group_layout.addWidget(rate_help)
-
-        rates_group.setLayout(rates_group_layout)
-        layout.addWidget(rates_group)
-
-        layout.addSpacing(10)
-
-        self.show_terminal_checkbox = QCheckBox("Show detailed terminal output in separate window")
-        self.show_terminal_checkbox.stateChanged.connect(self.toggle_terminal_output)
-        layout.addWidget(self.show_terminal_checkbox)
-
-        layout.addSpacing(5)
-
-        self.show_auto_captions_checkbox = QCheckBox(
-            "Show auto-generated captions in subtitle dropdown"
-        )
-        self.show_auto_captions_checkbox.stateChanged.connect(
-            self.on_show_auto_captions_changed
-        )
-        layout.addWidget(self.show_auto_captions_checkbox)
-
-        layout.addSpacing(10)
-
-        self.save_settings_btn = QPushButton("Save Settings")
-        self.save_settings_btn.clicked.connect(
-            lambda checked=False: self.save_settings(show_feedback=True)
-        )
-        layout.addWidget(self.save_settings_btn)
-
-        layout.addStretch()
-
-        info_label = QLabel(f"Settings auto-saved to: {self.config_file}")
-        info_label.setWordWrap(True)
-        info_label.setStyleSheet(f"color: {self.COLORS['text_secondary']};")
-        layout.addWidget(info_label)
-
-        self.tabs.addTab(options_widget, "Options")
-
-    def configure_about_status_label(self, label):
-        """Allow dependency status text to wrap inside its About column."""
-        label.setWordWrap(True)
-        label.setMinimumWidth(0)
-        label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-
-    def create_about_tab(self):
-        """Build a compact About page that scrolls when display scaling needs more space."""
-        about_widget = QWidget()
-        about_widget.setObjectName("aboutContent")
-        about_widget.setStyleSheet(
-            'QLabel { font-size: 13px; }'
-            'QLabel#aboutTitle { font-size: 18px; font-weight: bold; }'
-            'QLabel[aboutHeading="true"] { font-size: 14px; font-weight: bold; }'
-        )
-        layout = QVBoxLayout(about_widget)
-        layout.setContentsMargins(24, 20, 24, 20)
-        layout.setSpacing(16)
-
-        header_layout = QHBoxLayout()
-        header_layout.setSpacing(16)
-        self.about_logo_label = QLabel()
-        self.about_logo_label.setFixedSize(80, 80)
-        self.about_logo_label.setScaledContents(True)
-        self.about_logo_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        header_layout.addWidget(self.about_logo_label)
-
-        version_layout = QVBoxLayout()
-        version_layout.setSpacing(4)
-        version_layout.addStretch()
-        app_title = QLabel("mme89 yt-dlp GUI")
-        app_title.setObjectName("aboutTitle")
-        version_layout.addWidget(app_title)
-        version_label = QLabel(f"Version {APP_VERSION}")
-        version_label.setStyleSheet(f"color: {self.COLORS['text_secondary']};")
-        version_layout.addWidget(version_label)
-        version_layout.addStretch()
-        header_layout.addLayout(version_layout, 1)
-
-        update_layout = QVBoxLayout()
-        update_layout.setSpacing(6)
-        update_layout.addStretch()
-        self.check_updates_button = QPushButton("Check for Updates")
-        self.check_updates_button.clicked.connect(self.check_for_updates)
-        update_layout.addWidget(self.check_updates_button, 0, Qt.AlignmentFlag.AlignRight)
-        self.update_status_label = QLabel("Updates are checked automatically.")
-        self.configure_about_status_label(self.update_status_label)
-        self.update_status_label.setMaximumWidth(360)
-        self.update_status_label.setAlignment(Qt.AlignmentFlag.AlignRight)
-        self.update_status_label.setTextFormat(Qt.TextFormat.RichText)
-        self.update_status_label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextBrowserInteraction
-        )
-        self.update_status_label.setOpenExternalLinks(True)
-        self.update_status_label.setStyleSheet(f"color: {self.COLORS['text_secondary']};")
-        update_layout.addWidget(self.update_status_label)
-        update_layout.addStretch()
-        header_layout.addLayout(update_layout, 1)
-        layout.addLayout(header_layout)
-
-        description = QLabel(
-            "A graphical interface for yt-dlp with format selection, "
-            "playlist support, and download queue management."
-        )
-        description.setWordWrap(True)
-        layout.addWidget(description)
-        project_links = QLabel(
-            '<a href="https://github.com/mme89/yt-dlp-gui">GitHub</a>'
-            ' · Licensed under GNU GPL v3+ · '
-            '<a href="https://github.com/mme89/yt-dlp-gui/blob/main/LICENSE">View license</a>'
-        )
-        project_links.setWordWrap(True)
-        project_links.setOpenExternalLinks(True)
-        layout.addWidget(project_links)
-
-        dependencies = QGridLayout()
-        dependencies.setHorizontalSpacing(24)
-        dependencies.setVerticalSpacing(10)
-        dependency_details = (
-            (
-                "yt-dlp", "ytdlp_version_label", "Checking version…",
-                f"Core download engine. Recommended: {RECOMMENDED_YTDLP_VERSION} or newer."
-                "<br><br>Python installs require Python 3.11+. "
-                "Windows binaries require Windows 10+.",
-                '<a href="https://github.com/yt-dlp/yt-dlp">yt-dlp on GitHub</a>',
-            ),
-            (
-                "JS Runtime", "js_runtime_version_label", "Checking runtime…",
-                "Used for YouTube JavaScript extraction. "
-                "Prefer Deno 2.3+ or Node.js 22+."
-                "<br><br>QuickJS is also supported. "
-                "Bun is deprecated (1.2.11–1.3.14 only).",
-                '<a href="https://github.com/yt-dlp/yt-dlp/wiki/EJS">Runtime setup guide</a>',
-            ),
-            (
-                "yt-dlp-ejs", "ytdlp_ejs_status_label", "Managed by yt-dlp (not verified)",
-                "Challenge solver scripts for full YouTube support. "
-                "Included in official yt-dlp binaries."
-                "<br><br>For pip installs: pip install -U &quot;yt-dlp[default]&quot; "
-                "in the environment containing yt-dlp.",
-                '<a href="https://github.com/yt-dlp/ejs">EJS on GitHub</a>',
-            ),
-            (
-                "FFmpeg", "ffmpeg_version_label", "Checking version…",
-                "Used for merging video and audio streams.",
-                '<a href="https://github.com/FFmpeg/FFmpeg">FFmpeg on GitHub</a>',
-            ),
-        )
-        for column, (title, status_name, initial_status, details, link) in enumerate(
-            dependency_details
-        ):
-            dependencies.setColumnStretch(column, 1)
-            heading = QLabel(title)
-            heading.setProperty("aboutHeading", True)
-            dependencies.addWidget(heading, 0, column)
-            status = QLabel(initial_status)
-            self.configure_about_status_label(status)
-            status.setTextFormat(Qt.TextFormat.PlainText)
-            status.setStyleSheet(f"color: {self.COLORS['text_secondary']};")
-            setattr(self, status_name, status)
-            dependencies.addWidget(status, 1, column, Qt.AlignmentFlag.AlignTop)
-            info = QLabel(details)
-            self.configure_about_status_label(info)
-            info.setTextFormat(Qt.TextFormat.RichText)
-            dependencies.addWidget(info, 2, column, Qt.AlignmentFlag.AlignTop)
-            docs_link = QLabel(link)
-            docs_link.setWordWrap(True)
-            docs_link.setOpenExternalLinks(True)
-            dependencies.addWidget(docs_link, 3, column, Qt.AlignmentFlag.AlignTop)
-        layout.addLayout(dependencies)
-        layout.addStretch()
-
-        footer = QLabel("© 2025-2026 mme89")
-        footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        footer.setStyleSheet(f"color: {self.COLORS['text_secondary']};")
-        layout.addWidget(footer)
-
-        self.about_scroll_area = QScrollArea()
-        self.about_scroll_area.setObjectName("aboutScrollArea")
-        self.about_scroll_area.setWidgetResizable(True)
-        self.about_scroll_area.setFrameShape(QFrame.Shape.NoFrame)
-        self.about_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.about_scroll_area.setWidget(about_widget)
-        self.tabs.addTab(self.about_scroll_area, "About")
 
     def check_for_updates(self):
         """Check the GUI's published releases in the background."""
@@ -1095,11 +270,11 @@ class YtDlpGUI(CommandMixin, QMainWindow):
             notification.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
             notification.buttonClicked.connect(
                 lambda button: QDesktopServices.openUrl(QUrl(release_url))
-                if notification.standardButton(button) == QMessageBox.StandardButton.Open else None
+                if notification.standardButton(button) == QMessageBox.StandardButton.Open
+                else None
             )
             notification.finished.connect(self.on_update_notification_closed)
             self.update_notification = notification
-            # Show without a nested event loop or blocking the main window.
             notification.setModal(False)
             notification.show()
 
@@ -1107,12 +282,32 @@ class YtDlpGUI(CommandMixin, QMainWindow):
         """Release the reference to the dismissed update notification."""
         self.update_notification = None
 
+    def append_terminal_output(self, text):
+        """Buffer yt-dlp output and stream it live to the terminal window if visible."""
+        if self.is_closing:
+            return
+        self._terminal_buffer.append(text)
+        if self.terminal_window and self.terminal_window.isVisible():
+            self.terminal_window.append(text)
+
+    def clear_terminal_output(self):
+        """Clear buffered terminal output and the visible terminal window."""
+        self._terminal_buffer.clear()
+        if self.terminal_window:
+            self.terminal_window.output.clear()
+
+    def on_terminal_cleared(self):
+        """Keep the live terminal buffer in sync when the user clicks Clear."""
+        self._terminal_buffer.clear()
+
     def toggle_terminal_output(self, state):
-        """Toggle visibility of terminal output window"""
+        """Toggle visibility of terminal output window."""
         if Qt.CheckState(state) == Qt.CheckState.Checked:
             if not self.terminal_window:
                 self.terminal_window = TerminalWindow(self)
                 self.terminal_window.closed.connect(self.on_terminal_closed)
+                self.terminal_window.cleared.connect(self.on_terminal_cleared)
+            self.terminal_window.set_text("".join(self._terminal_buffer))
             self.terminal_window.show()
             self.terminal_window.raise_()
             self.terminal_window.activateWindow()
@@ -1121,7 +316,7 @@ class YtDlpGUI(CommandMixin, QMainWindow):
                 self.terminal_window.hide()
 
     def on_terminal_closed(self):
-        """Handle terminal window being closed"""
+        """Handle terminal window being closed."""
         if self.is_closing:
             return
         self.show_terminal_checkbox.setChecked(False)
@@ -1145,19 +340,23 @@ class YtDlpGUI(CommandMixin, QMainWindow):
             self.ffmpeg_path_input.setText(file_path)
 
     def is_valid_url(self, url):
-        """Validate if the URL is a valid YouTube/video URL"""
-        if not url:
+        """Validate if the URL is a valid HTTP/HTTPS URL (including long TLDs and IPv6)."""
+        if not url or any(ch.isspace() for ch in url):
             return False
 
-        url_pattern = re.compile(
-            r'^https?://'
-            r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+[A-Z]{2,6}\.?|'
-            r'localhost|'
-            r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'
-            r'(?::\d+)?'
-            r'(?:/?|[/?]\S+)$', re.IGNORECASE)
+        try:
+            parsed = urlparse(url)
+            _ = parsed.port
+        except ValueError:
+            return False
 
-        return bool(url_pattern.match(url))
+        if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+            return False
+
+        host = parsed.hostname
+        if host == "localhost" or ":" in host:
+            return True
+        return "." in host and not host.startswith(".") and not host.endswith("..")
 
     def get_validated_url(self):
         """Return the current URL or show a warning when it is not usable."""
@@ -1176,666 +375,135 @@ class YtDlpGUI(CommandMixin, QMainWindow):
 
         return url
 
-    def find_executable(self, name):
-        """Find executable in common locations across platforms"""
-        if os.path.isfile(name) and os.access(name, os.X_OK):
-            return name
-
-        common_paths = []
-
-        if sys.platform == 'darwin':
-            common_paths = [
-                f"/usr/local/bin/{name}",
-                f"/opt/homebrew/bin/{name}",
-                f"/opt/local/bin/{name}",
-                f"/usr/bin/{name}",
-                os.path.expanduser(f"~/.local/bin/{name}"),
-            ]
-        elif sys.platform == 'win32':
-            exe_name = name if name.endswith('.exe') else f"{name}.exe"
-            common_paths = [
-                os.path.expanduser(f"~\\AppData\\Local\\Programs\\{name}\\{exe_name}"),
-                os.path.expanduser(f"~\\AppData\\Local\\{name}\\{exe_name}"),
-                f"C:\\Program Files\\{name}\\{exe_name}",
-                f"C:\\Program Files (x86)\\{name}\\{exe_name}",
-                os.path.expanduser(f"~\\scoop\\shims\\{exe_name}"),
-                f"C:\\ProgramData\\chocolatey\\bin\\{exe_name}",
-                f"C:\\Windows\\System32\\{exe_name}",
-            ]
-        else:
-            common_paths = [
-                f"/usr/local/bin/{name}",
-                f"/usr/bin/{name}",
-                f"/bin/{name}",
-                f"/snap/bin/{name}",
-                os.path.expanduser(f"~/.local/bin/{name}"),
-            ]
-
-        for path in common_paths:
-            if os.path.isfile(path) and os.access(path, os.X_OK):
-                return path
-
-        try:
-            if sys.platform == 'win32':
-                result = subprocess.run(
-                    ['where', name],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    **hidden_subprocess_kwargs(),
-                )
-            else:
-                result = subprocess.run(
-                    ['which', name], capture_output=True, text=True, check=False
-                )
-
-            if result.returncode == 0:
-                found_path = result.stdout.strip().split('\n', maxsplit=1)[0]
-                if found_path and os.path.isfile(found_path):
-                    return found_path
-        except (OSError, subprocess.SubprocessError):
-            pass
-
-        return name
-
-    def get_ytdlp_path(self):
-        """Get the yt-dlp path from settings"""
-        ytdlp_path = self.ytdlp_path_input.text().strip()
-        if ytdlp_path:
-            return os.path.expanduser(ytdlp_path)
-        return self.find_executable("yt-dlp")
-
-    def find_available_executable(self, *names):
-        """Return the first available executable path from the provided names."""
-        for name in names:
-            path = shutil.which(name)
-            if path:
-                return path
-
-            detected_path = self.find_executable(name)
-            if detected_path != name:
-                return detected_path
-
-        return None
-
-    def invalidate_js_runtime_cache(self, *_args):
-        """Mark JS runtime detection stale after relevant settings change."""
-        self.js_runtime_info = None
-        self.js_runtime_cache_dirty = True
-
-    def detect_js_runtime(self, force_refresh=False):
-        """Return cached JS runtime details, detecting them when needed."""
-        if not force_refresh and not self.js_runtime_cache_dirty:
-            return self.js_runtime_info
-
-        self.js_runtime_info = self._detect_js_runtime()
-        self.js_runtime_cache_dirty = False
-        return self.js_runtime_info
-
-    def _detect_js_runtime(self):
-        """Detect the JS runtime yt-dlp will use."""
-        custom_args = self.get_custom_options_args()
-        if "--no-js-runtimes" in custom_args:
-            return {
-                "source": "custom",
-                "name": "Custom runtime configuration",
-                "path": "",
-                "spec": "See custom options",
-            }
-        for index, arg in enumerate(custom_args):
-            runtime_spec = None
-            if arg == "--js-runtimes" and index + 1 < len(custom_args):
-                runtime_spec = custom_args[index + 1]
-            elif arg.startswith("--js-runtimes="):
-                runtime_spec = arg.split("=", 1)[1]
-
-            if not runtime_spec:
-                continue
-
-            runtime_entry = runtime_spec.split(",", 1)[0]
-            runtime_name, _, runtime_path = runtime_entry.partition(":")
-            runtime_name = runtime_name.strip()
-            runtime_path = runtime_path.strip()
-
-            display_names = {
-                "deno": "Deno",
-                "node": "Node",
-                "nodejs": "Node",
-                "bun": "Bun",
-                "quickjs": "QuickJS",
-                "qjs": "QuickJS",
-            }
-            executable_names = {
-                "deno": ("deno",),
-                "node": ("node", "nodejs"),
-                "nodejs": ("node", "nodejs"),
-                "bun": ("bun",),
-                "quickjs": ("qjs",),
-                "qjs": ("qjs",),
-            }
-
-            if not runtime_path and runtime_name in executable_names:
-                runtime_path = self.find_available_executable(*executable_names[runtime_name]) or ""
-
-            return {
-                "source": "custom",
-                "name": display_names.get(runtime_name, runtime_name or "Custom"),
-                "path": runtime_path,
-                "spec": runtime_spec,
-            }
-
-        runtime_candidates = (
-            ("Deno", "deno", ("deno",)),
-            ("Node", "node", ("node", "nodejs")),
-            ("QuickJS", "quickjs", ("qjs",)),
-            ("Bun", "bun", ("bun",)),
-        )
-        for display_name, runtime_name, executable_names in runtime_candidates:
-            runtime_path = self.find_available_executable(*executable_names)
-            if not runtime_path:
-                continue
-            version_line = self.get_runtime_version(display_name, runtime_path)
-            if is_supported_runtime(display_name, version_line):
-                return {
-                    "source": "auto",
-                    "name": display_name,
-                    "path": runtime_path,
-                    "spec": f"{runtime_name}:{runtime_path}",
-                    "version": version_line,
-                }
-
-        return None
-
-    def get_js_runtime_args(self):
-        """Auto-enable a supported JS runtime for yt-dlp when one is available."""
-        runtime_info = self.detect_js_runtime()
-        if not runtime_info or runtime_info["source"] == "custom":
-            return []
-
-        return ["--js-runtimes", runtime_info["spec"]]
-
-    def get_executable_version(
-        self, executable_path, version_args=("--version",), success_codes=(0,)
-    ):
-        """Return the first line of version output, with a bounded timeout."""
-        try:
-            result = subprocess.run(
-                [executable_path, *version_args],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-                timeout=3,
-                **hidden_subprocess_kwargs(),
-            )
-        except (OSError, subprocess.SubprocessError, ValueError):
-            return None
-
-        if result.returncode in success_codes:
-            output = (result.stdout or result.stderr or "").strip()
-            if output:
-                return output.splitlines()[0]
-        return None
-
-    def get_runtime_version(self, runtime_name, runtime_path):
-        """QuickJS reports its version in help output rather than --version."""
-        if os.path.isdir(runtime_path):
-            executable_name = {
-                "Deno": "deno", "Node": "node", "QuickJS": "qjs", "Bun": "bun",
-            }.get(runtime_name)
-            if not executable_name:
-                return None
-            if sys.platform == "win32":
-                executable_name += ".exe"
-            runtime_path = os.path.join(runtime_path, executable_name)
-        version_args = ("--help",) if runtime_name == "QuickJS" else ("--version",)
-        # QuickJS's help command returns 1 even when it prints valid version output.
-        success_codes = (0, 1) if runtime_name == "QuickJS" else (0,)
-        return self.get_executable_version(runtime_path, version_args, success_codes)
-
-    def check_js_runtime_version(self):
-        """Check which JS runtime yt-dlp will use and display its status."""
-        runtime_info = self.detect_js_runtime(force_refresh=True)
-
-        if not runtime_info:
-            self.js_runtime_version = "Not found"
-            self.js_runtime_version_label.setText(
-                "⚠️ No supported JS runtime found (Deno 2.3+ or Node.js 22+ recommended)"
-            )
-            self.js_runtime_version_label.setStyleSheet(
-                f"color: {self.COLORS['warning']}; font-style: italic;"
-            )
-            return
-
-        version_line = runtime_info.get("version")
-        if version_line is None and runtime_info["path"]:
-            version_line = self.get_runtime_version(runtime_info["name"], runtime_info["path"])
-
-        if version_line and not is_supported_runtime(runtime_info["name"], version_line):
-            self.js_runtime_version = version_line
-            self.js_runtime_version_label.setText(
-                f"⚠️ Unsupported or unrecognized: {runtime_info['name']} {version_line}"
-            )
-            self.js_runtime_version_label.setStyleSheet(
-                f"color: {self.COLORS['warning']}; font-weight: bold;"
-            )
-        elif version_line:
-            self.js_runtime_version = version_line
-            prefix = "Configured" if runtime_info["source"] == "custom" else "Using"
-            self.js_runtime_version_label.setText(
-                f"{prefix}: {runtime_info['name']} {version_line}"
-                + (" (deprecated)" if runtime_info["name"] == "Bun" else "")
-            )
-            color = self.COLORS['warning' if runtime_info['name'] == 'Bun' else 'success']
-            self.js_runtime_version_label.setStyleSheet(f"color: {color}; font-weight: bold;")
-        elif runtime_info["source"] == "custom":
-            self.js_runtime_version = runtime_info["spec"]
-            self.js_runtime_version_label.setText(
-                f"Configured (not verified): {runtime_info['spec']}"
-            )
-            self.js_runtime_version_label.setStyleSheet(
-                f"color: {self.COLORS['info']}; font-weight: bold;"
-            )
-        else:
-            self.js_runtime_version = runtime_info["name"]
-            self.js_runtime_version_label.setText(f"Using: {runtime_info['name']}")
-            self.js_runtime_version_label.setStyleSheet(
-                f"color: {self.COLORS['success']}; font-weight: bold;"
-            )
-
-    def check_ytdlp_ejs_status(self):
-        """The GUI's Python packages do not describe the external yt-dlp install."""
-        self.ytdlp_ejs_status = "Not verified"
-        self.ytdlp_ejs_status_label.setText("Managed by your yt-dlp installation (not verified)")
-        self.ytdlp_ejs_status_label.setStyleSheet(
-            f"color: {self.COLORS['info']}; font-weight: bold;"
-        )
-
-    def check_ytdlp_version(self):
-        """Check if yt-dlp is installed and get version"""
-        process = None
-        try:
-            ytdlp_path = self.get_ytdlp_path()
-            if sys.platform == 'win32':
-                result = subprocess.run(
-                    [ytdlp_path, "--version"],
-                    capture_output=True,
-                    text=True,
-                    encoding='utf-8',
-                    errors='replace',
-                    check=False,
-                    timeout=3,
-                    **hidden_subprocess_kwargs(),
-                )
-                exit_code = result.returncode
-                stdout = result.stdout or ""
-            else:
-                process = QProcess()
-                process.start(ytdlp_path, ["--version"])
-                process.waitForFinished(3000)
-                exit_code = process.exitCode()
-                stdout = bytes(process.readAllStandardOutput().data()).decode('utf-8')
-
-            if exit_code == 0:
-                version = stdout.strip()
-                self.ytdlp_version = version
-                update_recommended = needs_ytdlp_update(version)
-                self.ytdlp_version_label.setText(
-                    f"Installed version: {version}"
-                    + (f" — update to {RECOMMENDED_YTDLP_VERSION}+ recommended"
-                       if update_recommended else "")
-                )
-                color = self.COLORS['warning' if update_recommended else 'success']
-                self.ytdlp_version_label.setStyleSheet(f"color: {color}; font-weight: bold;")
-                self.statusBar().showMessage(f"yt-dlp {version} detected", 3000)
-            else:
-                self.ytdlp_version = "Not found"
-                self.ytdlp_version_label.setText("⚠️ yt-dlp not found - Please install it")
-                self.ytdlp_version_label.setStyleSheet(
-                    f"color: {self.COLORS['error']}; font-weight: bold;"
-                )
-
-                if sys.platform == 'darwin':
-                    install_msg = (
-                        "yt-dlp is not installed or not in your PATH.\n\n"
-                        "Please install it:\n"
-                        "• Using Homebrew: brew install yt-dlp\n"
-                        "• Or visit: https://github.com/yt-dlp/yt-dlp"
-                    )
-                elif sys.platform == 'win32':
-                    install_msg = (
-                        "yt-dlp is not installed or not in your PATH.\n\n"
-                        "Please install it:\n"
-                        "• Using winget: winget install yt-dlp\n"
-                        "• Using Chocolatey: choco install yt-dlp\n"
-                        "• Or visit: https://github.com/yt-dlp/yt-dlp"
-                    )
-                else:
-                    install_msg = (
-                        "yt-dlp is not installed or not in your PATH.\n\n"
-                        "Please install it:\n"
-                        '• Using pip (Python 3.11+): pip install -U "yt-dlp[default]"\n'
-                        "• Using your package manager (e.g., apt, dnf, pacman)\n"
-                        "• Or visit: https://github.com/yt-dlp/yt-dlp"
-                    )
-
-                QMessageBox.warning(self, "yt-dlp Not Found", install_msg)
-        except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as e:
-            self.ytdlp_version = "Error checking version"
-            self.ytdlp_version_label.setText("Error checking yt-dlp version")
-            self.ytdlp_version_label.setStyleSheet(f"color: {self.COLORS['warning']};")
-            print(f"Error checking yt-dlp version: {e}")
-        finally:
-            if process:
-                process.kill()
-                process.waitForFinished(500)
-                process.deleteLater()
-
-    def get_ffmpeg_path(self):
-        """Get the ffmpeg path from settings"""
-        ffmpeg_path = self.ffmpeg_path_input.text().strip()
-        if ffmpeg_path:
-            return os.path.expanduser(ffmpeg_path)
-        return self.find_executable("ffmpeg")
-
-    def check_ffmpeg_version(self):
-        """Check if FFmpeg is installed and get version"""
-        process = None
-        try:
-            ffmpeg_path = self.get_ffmpeg_path()
-            if sys.platform == 'win32':
-                result = subprocess.run(
-                    [ffmpeg_path, "-version"],
-                    capture_output=True,
-                    text=True,
-                    encoding='utf-8',
-                    errors='replace',
-                    check=False,
-                    timeout=3,
-                    **hidden_subprocess_kwargs(),
-                )
-                exit_code = result.returncode
-                output = result.stdout or ""
-            else:
-                process = QProcess()
-                process.start(ffmpeg_path, ["-version"])
-                process.waitForFinished(3000)
-                exit_code = process.exitCode()
-                output = bytes(process.readAllStandardOutput().data()).decode('utf-8')
-
-            if exit_code == 0:
-                first_line = output.split('\n', maxsplit=1)[0]
-                if 'version' in first_line:
-                    version = first_line.split('version')[1].strip().split()[0]
-                    self.ffmpeg_version = version
-                    self.ffmpeg_version_label.setText(f"Installed version: {version}")
-                    self.ffmpeg_version_label.setStyleSheet(
-                        f"color: {self.COLORS['success']}; font-weight: bold;"
-                    )
-                else:
-                    self.ffmpeg_version = "Unknown"
-                    self.ffmpeg_version_label.setText("Installed (version unknown)")
-                    self.ffmpeg_version_label.setStyleSheet(f"color: {self.COLORS['success']};")
-            else:
-                self.ffmpeg_version = "Not found"
-                self.ffmpeg_version_label.setText("⚠️ FFmpeg not found (optional)")
-                self.ffmpeg_version_label.setStyleSheet(
-                    f"color: {self.COLORS['warning']}; font-style: italic;"
-                )
-        except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as e:
-            self.ffmpeg_version = "Error checking version"
-            self.ffmpeg_version_label.setText("FFmpeg status unknown")
-            self.ffmpeg_version_label.setStyleSheet(
-                f"color: {self.COLORS['text_secondary']}; font-style: italic;"
-            )
-            print(f"Error checking FFmpeg version: {e}")
-        finally:
-            if process:
-                process.kill()
-                process.waitForFinished(500)
-                process.deleteLater()
-
     def fetch_formats(self):
         """Validate the URL and start fetching video metadata in the background."""
         if self.format_fetcher and self.format_fetcher.isRunning():
             self.download_page_status_label.setText("Already fetching formats...")
             return
 
-        url = self.url_input.text().strip()
-        if not url:
-            QMessageBox.warning(self, "Error", "Please enter a URL first!")
-            return
-
-        if not self.is_valid_url(url):
-            QMessageBox.warning(
-                self,
-                "Invalid URL",
-                "Please enter a valid URL (must start with http:// or https://)",
-            )
+        url = self.get_validated_url()
+        if url is None:
             return
 
         self.download_page_status_label.setText("Fetching formats...")
         self.analyze_btn.setEnabled(False)
+        self.cancel_analyze_btn.setEnabled(True)
 
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(False)
         self.status_label.setText("")
 
-        if self.terminal_window and self.terminal_window.isVisible():
-            self.terminal_window.clear()
+        self.clear_terminal_output()
 
-        args_without_url = self.build_ytdlp_args(["-J"])
+        custom_args = self.get_custom_options_args()
+        fetch_op_args = (
+            ["-J"]
+            if "--yes-playlist" in custom_args or "--no-playlist" in custom_args
+            else ["--no-playlist", "-J"]
+        )
+        args_without_url = self.build_ytdlp_args(fetch_op_args)
         if args_without_url is None:
             self.download_page_status_label.setText("Ready")
             self.analyze_btn.setEnabled(True)
+            self.cancel_analyze_btn.setEnabled(False)
             return
 
+        self.analyzed_url = None
         self.format_fetcher = FormatFetcher(
             url,
             self.get_ytdlp_path(),
             args_without_url=args_without_url,
         )
+        self.track_worker_thread(self.format_fetcher)
         self.format_fetcher.finished.connect(self.on_formats_fetched)
         self.format_fetcher.error.connect(self.on_fetch_error)
-
-        if self.terminal_window and self.terminal_window.isVisible():
-            self.connect_worker_output(self.format_fetcher, self.terminal_window)
+        self.format_fetcher.output.connect(self.append_terminal_output)
 
         self.format_fetcher.start()
+
+    def cancel_analyze(self):
+        """Cancel an in-progress metadata/format analysis."""
+        fetcher = self.format_fetcher
+        if not fetcher or not fetcher.isRunning():
+            return
+        self.cancel_analyze_btn.setEnabled(False)
+        self.download_page_status_label.setText("Cancelling analysis...")
+        fetcher.stop()
 
     def on_formats_fetched(self, data):
         """Populate format selectors and video details from the active fetcher."""
         fetcher = self.sender()
         if fetcher is not self.format_fetcher:
-            if fetcher:
-                fetcher.deleteLater()
             return
 
         self.format_fetcher = None
-        if fetcher:
-            fetcher.deleteLater()
         if self.is_closing:
             return
+        self.analyzed_url = getattr(fetcher, "url", None)
 
-        formats = data.get('formats', [])
-        self.subtitles = data.get('subtitles', {})
-        self.automatic_captions = data.get('automatic_captions', {})
+        self.subtitles = data.get("subtitles") or {}
+        self.automatic_captions = data.get("automatic_captions") or {}
+
+        video_formats, audio_formats, self.format_data = parse_video_formats(data.get("formats"))
 
         self.video_combo.clear()
-        self.audio_combo.clear()
-        self.subtitle_combo.clear()
-
-        video_formats = []
-        audio_formats = []
-        self.format_data = {}
-
-        for fmt in formats:
-            format_id = fmt.get('format_id', '')
-            ext = fmt.get('ext', '')
-            vcodec = fmt.get('vcodec', 'none')
-            acodec = fmt.get('acodec', 'none')
-            resolution = fmt.get('resolution', 'audio only')
-            fps = fmt.get('fps', 0)
-            abr = fmt.get('abr', 0)
-            filesize = fmt.get('filesize', 0)
-
-            if filesize:
-                if filesize > 1024 * 1024 * 1024:
-                    size_str = f"{filesize / (1024**3):.1f}GB"
-                elif filesize > 1024 * 1024:
-                    size_str = f"{filesize / (1024**2):.1f}MB"
-                else:
-                    size_str = f"{filesize / 1024:.1f}KB"
-            else:
-                size_str = ""
-
-            self.format_data[format_id] = fmt
-
-            if vcodec != 'none' and acodec == 'none':
-                fps_str = f" {fps}fps" if fps else ""
-                size_part = f" ({size_str})" if size_str else ""
-                label = f"{format_id}: {resolution} {ext}{fps_str}{size_part}"
-                video_formats.append((label, format_id, fmt))
-            elif acodec != 'none' and vcodec == 'none':
-                abr_str = f"{abr}kbps" if abr else "unknown bitrate"
-                size_part = f" ({size_str})" if size_str else ""
-                label = f"{format_id}: {ext} {abr_str}{size_part}"
-                audio_formats.append((label, format_id, fmt))
-
         self.video_combo.addItem("Best video", "bestvideo")
-        video_formats.sort(key=lambda x: x[2].get('height', 0), reverse=True)
-        for label, fid, _ in video_formats[:20]:
+        for label, fid, _ in video_formats:
             self.video_combo.addItem(label, fid)
         self.video_combo.addItem("No video (audio only)", "none")
 
+        self.audio_combo.clear()
         self.audio_combo.addItem("Best audio", "bestaudio")
-        audio_formats.sort(key=lambda x: x[2].get('abr', 0), reverse=True)
-        for label, fid, _ in audio_formats[:15]:
+        for label, fid, _ in audio_formats:
             self.audio_combo.addItem(label, fid)
         self.audio_combo.addItem("No audio (video only)", "none")
 
-        self.subtitle_combo.addItem("None", "")
+        self.populate_subtitle_dropdown()
 
-        show_auto_captions = self.show_auto_captions_checkbox.isChecked()
-        has_subtitles = bool(self.subtitles or (self.automatic_captions and show_auto_captions))
+        metadata = extract_video_metadata(data)
+        self.title_label.setText(f"Title: {metadata['title']}")
+        self.duration_label.setText(f"Duration: {metadata['duration']}")
+        self.uploader_label.setText(f"Uploader: {metadata['uploader']}")
+        self.upload_date_label.setText(f"Uploaded: {metadata['upload_date']}")
+        self.views_label.setText(f"Views: {metadata['views']}")
+        self.likes_label.setText(f"Likes: {metadata['likes']}")
 
-        if has_subtitles:
-            self.subtitle_combo.addItem("All subtitles", "all")
-
-            if self.subtitles:
-                for lang_code in sorted(self.subtitles.keys()):
-                    self.subtitle_combo.addItem(f"{lang_code} (manual)", lang_code)
-
-            if self.automatic_captions and show_auto_captions:
-                for lang_code in sorted(self.automatic_captions.keys()):
-                    if lang_code not in self.subtitles:
-                        self.subtitle_combo.addItem(f"{lang_code} (auto)", lang_code)
+        if metadata["thumbnail"]:
+            self.load_thumbnail(metadata["thumbnail"])
         else:
-            self.subtitle_combo.addItem("English (if available)", "en")
-
-        self.update_subtitle_option_states()
-
-        title = data.get('title', 'Unknown')
-        duration = data.get('duration', 0)
-        uploader = data.get('uploader', 'Unknown')
-        upload_date = data.get('upload_date', '')
-        view_count = data.get('view_count', 0)
-        like_count = data.get('like_count', 0)
-        dislike_count = data.get('dislike_count', 0)
-
-        if duration:
-            hours = int(duration // 3600)
-            minutes = int((duration % 3600) // 60)
-            seconds = int(duration % 60)
-            if hours > 0:
-                duration_str = f"{hours}:{minutes:02d}:{seconds:02d}"
-            else:
-                duration_str = f"{minutes}:{seconds:02d}"
-        else:
-            duration_str = "Unknown"
-
-        if upload_date and len(upload_date) == 8:
-            year = upload_date[0:4]
-            month = upload_date[4:6]
-            day = upload_date[6:8]
-            upload_date_str = f"{year}-{month}-{day}"
-        else:
-            upload_date_str = "Unknown"
-
-        if view_count:
-            if view_count >= 1_000_000:
-                views_str = f"{view_count / 1_000_000:.1f}M views"
-            elif view_count >= 1_000:
-                views_str = f"{view_count / 1_000:.1f}K views"
-            else:
-                views_str = f"{view_count} views"
-        else:
-            views_str = "Unknown"
-
-        def format_count(count):
-            """Format a viewer count using compact thousands or millions suffixes."""
-            if count >= 1_000_000:
-                return f"{count / 1_000_000:.1f}M"
-            if count >= 1_000:
-                return f"{count / 1_000:.1f}K"
-            return str(count)
-
-        likes_parts = []
-        if like_count:
-            likes_parts.append(f"👍 {format_count(like_count)}")
-        if dislike_count:
-            likes_parts.append(f"👎 {format_count(dislike_count)}")
-
-        if likes_parts:
-            likes_str = " | ".join(likes_parts)
-        elif like_count == 0 and dislike_count == 0:
-            likes_str = "No data available"
-        else:
-            likes_str = "Unknown"
-
-        self.title_label.setText(f"Title: {title}")
-        self.duration_label.setText(f"Duration: {duration_str}")
-        self.uploader_label.setText(f"Uploader: {uploader}")
-        self.upload_date_label.setText(f"Uploaded: {upload_date_str}")
-        self.views_label.setText(f"Views: {views_str}")
-        self.likes_label.setText(f"Likes: {likes_str}")
-
-        thumbnail_url = data.get('thumbnail', '')
-        if thumbnail_url:
-            self.load_thumbnail(thumbnail_url)
-        else:
+            self._cancel_active_thumbnail_reply()
+            self.thumbnail_label.clear()
             self.thumbnail_label.setText("No thumbnail available")
 
         self.download_page_status_label.setText(
             f"Loaded {len(video_formats)} video + {len(audio_formats)} audio formats"
         )
         self.analyze_btn.setEnabled(True)
+        self.cancel_analyze_btn.setEnabled(False)
 
     def on_fetch_error(self, error):
         """Restore download controls and report an active metadata fetch failure."""
         fetcher = self.sender()
         if fetcher is not self.format_fetcher:
-            if fetcher:
-                fetcher.deleteLater()
             return
 
         self.format_fetcher = None
-        if fetcher:
-            fetcher.deleteLater()
         if self.is_closing:
+            return
+        self.analyzed_url = None
+        self.cancel_analyze_btn.setEnabled(False)
+        self.analyze_btn.setEnabled(True)
+
+        if getattr(fetcher, "stop_requested", False):
+            self.download_page_status_label.setText("Analysis cancelled")
             return
 
         QMessageBox.critical(self, "Error", f"Failed to fetch formats: {error}")
         self.download_page_status_label.setText("Error fetching formats")
-        self.analyze_btn.setEnabled(True)
 
-    def refresh_subtitle_dropdown(self):
-        """Refresh subtitle dropdown when auto-captions checkbox is toggled"""
-        if not hasattr(self, 'subtitles') or not hasattr(self, 'automatic_captions'):
-            return
-
-        current_selection = self.subtitle_combo.currentData()
+    def populate_subtitle_dropdown(self, *, preserve_selection=False):
+        """Populate the subtitle dropdown from fetched manual and auto captions."""
+        current_selection = self.subtitle_combo.currentData() if preserve_selection else None
 
         self.subtitle_combo.clear()
         self.subtitle_combo.addItem("None", "")
@@ -1857,12 +525,19 @@ class YtDlpGUI(CommandMixin, QMainWindow):
         else:
             self.subtitle_combo.addItem("English (if available)", "en")
 
-        for i in range(self.subtitle_combo.count()):
-            if self.subtitle_combo.itemData(i) == current_selection:
-                self.subtitle_combo.setCurrentIndex(i)
-                break
+        if preserve_selection and current_selection is not None:
+            for i in range(self.subtitle_combo.count()):
+                if self.subtitle_combo.itemData(i) == current_selection:
+                    self.subtitle_combo.setCurrentIndex(i)
+                    break
 
         self.update_subtitle_option_states()
+
+    def refresh_subtitle_dropdown(self):
+        """Refresh subtitle dropdown when auto-captions checkbox is toggled."""
+        if not hasattr(self, "subtitles") or not hasattr(self, "automatic_captions"):
+            return
+        self.populate_subtitle_dropdown(preserve_selection=True)
 
     def on_show_auto_captions_changed(self, *_args):
         """Handle auto-caption visibility changes."""
@@ -1888,49 +563,75 @@ class YtDlpGUI(CommandMixin, QMainWindow):
             return False
 
         if subtitle_lang == "all":
-            return self.show_auto_captions_checkbox.isChecked()
+            return False
 
         return (
             subtitle_lang in self.automatic_captions
             and self.subtitle_combo.currentText().endswith("(auto)")
         )
 
-    def add_subtitle_args(self, args):
+    def add_subtitle_args(self, args, *, embed=True):
         """Append subtitle-related yt-dlp arguments based on the current UI state."""
         subtitle_lang = self.subtitle_combo.currentData()
         if not subtitle_lang:
             return
 
-        args.append("--embed-subs")
-        if self.subtitle_selection_includes_auto_captions(subtitle_lang):
-            args.append("--write-auto-subs")
-        if self.keep_subtitle_files_checkbox.isChecked():
-            args.append("--write-subs")
+        includes_auto = self.subtitle_selection_includes_auto_captions(subtitle_lang)
+        keep_files = self.keep_subtitle_files_checkbox.isChecked()
+
+        if embed:
+            args.append("--embed-subs")
+            if includes_auto:
+                args.append("--write-auto-subs")
+                if not keep_files:
+                    args.extend(["--compat-options", "no-keep-subs"])
+            if keep_files:
+                args.append("--write-subs")
+        else:
+            args.append("--write-auto-subs" if includes_auto else "--write-subs")
 
         if subtitle_lang != "all":
             args.extend(["--sub-langs", subtitle_lang])
         else:
             args.extend(["--sub-langs", self.get_all_subtitle_langs_value()])
 
+    def _cancel_active_thumbnail_reply(self):
+        """Abort and detach any in-flight thumbnail network reply."""
+        reply = self.active_thumbnail_reply
+        self.active_thumbnail_reply = None
+        if reply is not None:
+            try:
+                reply.finished.disconnect(self.on_thumbnail_loaded)
+            except (RuntimeError, TypeError):
+                pass
+            reply.abort()
+            reply.deleteLater()
+
     def load_thumbnail(self, url):
-        """Load thumbnail using QtNetwork for better PyInstaller compatibility"""
+        """Load thumbnail using QtNetwork for better PyInstaller compatibility."""
         try:
-            if self.active_thumbnail_reply:
-                self.active_thumbnail_reply.abort()
-                self.active_thumbnail_reply.deleteLater()
-                self.active_thumbnail_reply = None
+            self._cancel_active_thumbnail_reply()
             request = QNetworkRequest(QUrl(url))
-            self.active_thumbnail_reply = self.network_manager.get(request)
-            self.active_thumbnail_reply.finished.connect(self.on_thumbnail_loaded)
+            request.setAttribute(
+                QNetworkRequest.Attribute.RedirectPolicyAttribute,
+                QNetworkRequest.RedirectPolicy.NoLessSafeRedirectPolicy,
+            )
+            reply = self.network_manager.get(request)
+            self.active_thumbnail_reply = reply
+            reply.finished.connect(self.on_thumbnail_loaded)
         except (RuntimeError, TypeError, ValueError):
+            self.thumbnail_label.clear()
             self.thumbnail_label.setText("Failed to load thumbnail")
 
     def on_thumbnail_loaded(self):
-        """Handle thumbnail download completion"""
-        reply = self.active_thumbnail_reply
-        if not reply:
+        """Handle thumbnail download completion."""
+        reply = self.sender()
+        if reply is not self.active_thumbnail_reply:
+            if reply is not None:
+                reply.deleteLater()
             return
 
+        self.active_thumbnail_reply = None
         try:
             if self.is_closing:
                 return
@@ -1940,25 +641,32 @@ class YtDlpGUI(CommandMixin, QMainWindow):
                 if pixmap.loadFromData(image_data):
                     self.thumbnail_label.setPixmap(pixmap)
                 else:
+                    self.thumbnail_label.clear()
                     self.thumbnail_label.setText("Failed to load thumbnail")
             else:
                 error_string = reply.errorString()
                 print(f"Network error loading thumbnail: {error_string}")
+                self.thumbnail_label.clear()
                 self.thumbnail_label.setText("Failed to load thumbnail")
         except (RuntimeError, TypeError, ValueError) as e:
             print(f"Exception loading thumbnail: {e}")
+            self.thumbnail_label.clear()
             self.thumbnail_label.setText("Failed to load thumbnail")
         finally:
-            if reply == self.active_thumbnail_reply:
-                self.active_thumbnail_reply = None
             reply.deleteLater()
 
     def append_worker_output(self, output_widget, text):
-        """Append worker output to a caller-selected widget."""
-        if self.is_closing:
+        """Append worker output to a caller-selected widget without double-spacing."""
+        if self.is_closing or not output_widget:
             return
 
-        if output_widget:
+        if isinstance(output_widget, QPlainTextEdit):
+            cursor = output_widget.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            cursor.insertText(text)
+            output_widget.setTextCursor(cursor)
+            output_widget.ensureCursorVisible()
+        else:
             output_widget.append(text)
 
     def connect_worker_output(self, worker, output_widget):
@@ -1968,9 +676,21 @@ class YtDlpGUI(CommandMixin, QMainWindow):
                 lambda text, widget=output_widget: self.append_worker_output(widget, text)
             )
 
+    def track_worker_thread(self, thread):
+        """Keep a QThread alive until Qt's finished signal fires, then schedule deletion."""
+        self._worker_threads.add(thread)
+        thread.finished.connect(lambda t=thread: self._release_worker_thread(t))
+
+    def _release_worker_thread(self, thread):
+        """Release a completed QThread once its run() method has exited."""
+        self._worker_threads.discard(thread)
+        thread.deleteLater()
+
     def on_download_thread_finished(self, exit_code):
         """Dispatch normal download completion based on the sending thread."""
         thread = self.sender()
+        if thread is not self.download_thread:
+            return
         is_download = getattr(thread, "is_download", True)
         stop_requested = getattr(thread, "stop_requested", False)
         self.on_download_finished(exit_code, is_download, stop_requested)
@@ -1994,29 +714,32 @@ class YtDlpGUI(CommandMixin, QMainWindow):
     def set_command_controls_enabled(self, enabled):
         """Enable or disable controls that start yt-dlp command threads."""
         can_start = enabled and not self.is_processing_queue and not self.is_ytdlp_command_running()
+        has_pending_queue = any(item["status"] == "Pending" for item in self.download_queue)
+        playlist_downloading = bool(
+            self.current_playlist_downloads and self.is_ytdlp_command_running()
+        )
 
         self.download_btn.setEnabled(can_start)
-        self.add_to_queue_btn.setEnabled(can_start)
+        self.add_to_queue_btn.setEnabled(True)
         self.execute_custom_btn.setEnabled(can_start)
         self.metadata_btn.setEnabled(can_start)
         self.list_subs_btn.setEnabled(can_start)
+        self.cancel_advanced_btn.setEnabled(
+            bool(
+                self.download_thread
+                and self.download_thread.isRunning()
+                and not getattr(self.download_thread, "is_download", True)
+            )
+        )
+        self.list_playlist_btn.setEnabled(not playlist_downloading and not self.playlist_fetcher)
         self.download_playlist_btn.setEnabled(can_start and self.playlist_table.rowCount() > 0)
-        self.start_queue_btn.setEnabled(can_start and bool(self.download_queue))
+        self.start_queue_btn.setEnabled(can_start and has_pending_queue)
         self.stop_queue_btn.setEnabled(self.is_processing_queue)
+        self.clear_queue_btn.setEnabled(not self.is_processing_queue)
 
     def download_video(self):
         """Validate the selected video and start downloading the chosen formats."""
-        url = self.url_input.text().strip()
-        if not url:
-            QMessageBox.warning(self, "Error", "Please enter a URL first!")
-            return
-
-        if not self.is_valid_url(url):
-            QMessageBox.warning(
-                self,
-                "Invalid URL",
-                "Please enter a valid URL (must start with http:// or https://)",
-            )
+        if self.get_validated_url() is None:
             return
 
         selection = self.build_selected_download_args()
@@ -2024,339 +747,40 @@ class YtDlpGUI(CommandMixin, QMainWindow):
             return
 
         args, _, format_display = selection
-
         self.run_yt_dlp(args, is_download=True, format_display=format_display)
 
-    def add_to_queue(self):
-        """Add current video to download queue"""
-        url = self.url_input.text().strip()
-        if not url:
-            QMessageBox.warning(self, "Error", "Please enter a URL first!")
-            return
-
-        if not self.is_valid_url(url):
-            QMessageBox.warning(
-                self,
-                "Invalid URL",
-                "Please enter a valid URL (must start with http:// or https://)",
-            )
-            return
-
-        selection = self.build_selected_download_args()
-        if not selection:
-            return
-
-        args, format_id, format_display = selection
-
-        title = (
-            self.title_label.text().replace("Title: ", "")
-            if self.title_label.text() != "Title: -"
-            else "Unknown"
-        )
-
-        total_size = self.calculate_format_size(format_id)
-
-        queue_item = {
-            "url": url,
-            "args": args,
-            "format": format_id,
-            "format_display": format_display,
-            "title": title,
-            "size": total_size,
-            "status": "Pending"
-        }
-        self.download_queue.append(queue_item)
-        self.update_queue_table()
-        self.set_command_controls_enabled(True)
-
-        QMessageBox.information(
-            self,
-            "Added to Queue",
-            f"Video added to queue!\n\nTotal items in queue: {len(self.download_queue)}",
-        )
-
-    def update_queue_table(self):
-        """Update the queue table display"""
-        self.queue_table.setRowCount(len(self.download_queue))
-
-        for i, item in enumerate(self.download_queue):
-            index_item = QTableWidgetItem(str(i + 1))
-            index_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.queue_table.setItem(i, 0, index_item)
-
-            status_item = QTableWidgetItem(item["status"])
-            status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            if item["status"] == "Completed":
-                status_item.setForeground(QColor(self.COLORS['success']))
-            elif item["status"] == "Failed":
-                status_item.setForeground(QColor(self.COLORS['error']))
-            elif item["status"] == "Downloading":
-                status_item.setForeground(QColor(self.COLORS['info']))
-            elif item["status"] == "Aborted":
-                status_item.setForeground(QColor(self.COLORS['warning']))
-            self.queue_table.setItem(i, 1, status_item)
-
-            url_display = item["url"][:50] + "..." if len(item["url"]) > 50 else item["url"]
-            self.queue_table.setItem(i, 2, QTableWidgetItem(url_display))
-
-            self.queue_table.setItem(i, 3, QTableWidgetItem(item["title"]))
-
-            format_display = item.get("format_display", item["format"])
-            format_item = QTableWidgetItem(format_display)
-            format_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.queue_table.setItem(i, 4, format_item)
-
-            size_display = item.get("size", "Unknown")
-            size_item = QTableWidgetItem(size_display)
-            size_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.queue_table.setItem(i, 5, size_item)
-
-        if len(self.download_queue) == 0:
-            self.queue_status_label.setText("Queue is empty. Add videos from the Download tab.")
-        else:
-            completed = sum(1 for item in self.download_queue if item["status"] == "Completed")
-            failed = sum(1 for item in self.download_queue if item["status"] == "Failed")
-            pending = sum(1 for item in self.download_queue if item["status"] == "Pending")
-            self.queue_status_label.setText(
-                f"Total: {len(self.download_queue)} | Pending: {pending} | "
-                f"Completed: {completed} | Failed: {failed}"
-            )
-
-    def start_queue_processing(self):
-        """Start processing the download queue"""
-        if not self.download_queue:
-            QMessageBox.warning(self, "Error", "Queue is empty!")
-            return
-
-        if self.is_processing_queue:
-            QMessageBox.warning(self, "Error", "Queue is already being processed!")
-            return
-
-        if self.warn_if_ytdlp_command_running():
-            return
-
-        self.is_processing_queue = True
-        self.set_command_controls_enabled(False)
-        self.statusBar().showMessage("Processing queue...")
-        self.process_next_in_queue()
-
-    def process_next_in_queue(self):
-        """Process the next item in the queue"""
-        if not self.is_processing_queue:
-            return
-
-        next_item = None
-        for item in self.download_queue:
-            if item["status"] == "Pending":
-                next_item = item
-                break
-
-        if not next_item:
-            self.is_processing_queue = False
-            self.set_command_controls_enabled(True)
-            self.progress_bar.setValue(0)
-            self.progress_bar.setTextVisible(False)
-            self.status_label.setText("")
-            self.abort_btn.setEnabled(False)
-            self.statusBar().showMessage("Queue processing completed!", 5000)
-            QMessageBox.information(
-                self,
-                "Queue Complete",
-                "All downloads in the queue have been processed!",
-            )
-            return
-
-        next_item["status"] = "Downloading"
-        self.current_queue_item = next_item
-        self.update_queue_table()
-
-        if not self.run_yt_dlp_queue(
-            next_item["args"], next_item["url"], next_item.get("format_display", "")
-        ):
-            next_item["status"] = "Pending"
-            self.current_queue_item = None
-            self.is_processing_queue = False
-            self.set_command_controls_enabled(True)
-            self.update_queue_table()
-
-    def run_yt_dlp_queue(self, args, url, format_display=""):
-        """Run yt-dlp for queue item"""
-        if self.warn_if_ytdlp_command_running():
-            return False
-
-        if format_display:
-            output_template = f"%(title)s [{format_display}].%(ext)s"
-        else:
-            output_template = "%(title)s [%(format_id)s].%(ext)s"
-
-        args = self.build_ytdlp_args(args, is_download=True, output_template=output_template)
-        if args is None:
-            return False
-
-        if self.terminal_window and self.terminal_window.isVisible():
-            self.terminal_window.append(f"\n{'='*60}\n")
-            self.terminal_window.append(f"Queue: Processing {url}\n")
-            self.terminal_window.append(f"Running: yt-dlp {' '.join(args)}\n")
-            self.terminal_window.append(f"{'='*60}\n")
-
-        self.set_command_controls_enabled(False)
-
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setTextVisible(True)
-        self.status_label.setText("Starting download...")
-
-        self.download_thread = DownloadThread(args, url, self.get_ytdlp_path())
-        if self.terminal_window and self.terminal_window.isVisible():
-            self.connect_worker_output(self.download_thread, self.terminal_window)
-        self.download_thread.progress.connect(self.update_queue_progress)
-        self.download_thread.finished_signal.connect(self.on_queue_download_finished)
-        self.download_thread.start()
-        return True
-
-    def update_queue_progress(self, percentage, status):
-        """Update progress bar and status label on Download page"""
-        self.progress_bar.setValue(percentage)
-        self.status_label.setText(status)
-
-    def on_queue_download_finished(self, exit_code):
-        """Handle completion of queue item download"""
-        thread = self.sender()
-        stop_requested = getattr(thread, "stop_requested", False)
-        self.download_thread = None
-        if self.is_closing:
-            return
-
-        was_aborted = stop_requested and exit_code != 0
-        finished_item = self.current_queue_item
-        self.current_queue_item = None
-
-        if finished_item:
-            if exit_code == 0:
-                finished_item["status"] = "Completed"
-            elif was_aborted:
-                finished_item["status"] = "Aborted"
-            else:
-                finished_item["status"] = "Failed"
-            self.update_queue_table()
-
-        if self.is_processing_queue:
-            self.process_next_in_queue()
-        else:
-            self.set_command_controls_enabled(True)
-
-    def stop_queue_processing(self):
-        """Stop processing the queue"""
-        if not self.is_processing_queue:
-            return
-
-        reply = QMessageBox.question(
-            self,
-            "Stop Queue",
-            "Stop processing the queue?\n\nThe current download will be aborted.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-
-        if reply == QMessageBox.StandardButton.Yes:
-            self.is_processing_queue = False
-            self.set_command_controls_enabled(True)
-
-            self.progress_bar.setValue(0)
-            self.progress_bar.setTextVisible(False)
-            self.status_label.setText("")
-            self.abort_btn.setEnabled(False)
-
-            if self.download_thread and self.download_thread.isRunning():
-                self.download_thread.stop()
-
-            if self.current_queue_item and self.current_queue_item["status"] == "Downloading":
-                self.current_queue_item["status"] = "Pending"
-                self.update_queue_table()
-            self.current_queue_item = None
-
-            self.statusBar().showMessage("Queue processing stopped", 3000)
-
-    def clear_queue(self):
-        """Clear all items from the queue"""
-        if not self.download_queue:
-            return
-
-        reply = QMessageBox.question(
-            self,
-            "Clear Queue",
-            f"Remove all {len(self.download_queue)} items from the queue?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-
-        if reply == QMessageBox.StandardButton.Yes:
-            self.download_queue.clear()
-            self.update_queue_table()
-            self.start_queue_btn.setEnabled(False)
-
-    def remove_selected_from_queue(self):
-        """Remove selected items from the queue"""
-        selected_rows = set(item.row() for item in self.queue_table.selectedItems())
-
-        if not selected_rows:
-            QMessageBox.warning(self, "Error", "Please select items to remove!")
-            return
-
-        for row in selected_rows:
-            if (
-                row < len(self.download_queue)
-                and self.download_queue[row]["status"] == "Downloading"
-            ):
-                QMessageBox.warning(
-                    self,
-                    "Error",
-                    "Cannot remove item that is currently downloading!",
-                )
-                return
-
-        reply = QMessageBox.question(
-            self,
-            "Remove Items",
-            f"Remove {len(selected_rows)} selected item(s) from queue?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-
-        if reply == QMessageBox.StandardButton.Yes:
-            for row in sorted(selected_rows, reverse=True):
-                if row < len(self.download_queue):
-                    del self.download_queue[row]
-
-            self.update_queue_table()
-
-            if len(self.download_queue) == 0:
-                self.start_queue_btn.setEnabled(False)
-
     def load_playlist_items(self):
-        """Load playlist items and display in table"""
+        """Load playlist items and display in table."""
         if self.playlist_fetcher and self.playlist_fetcher.isRunning():
             self.playlist_status_label.setText("Already loading playlist...")
             return
 
-        url = self.url_input.text().strip()
-        if not url:
-            QMessageBox.warning(self, "Error", "Please enter a URL first!")
-            return
-
-        if not self.is_valid_url(url):
+        if self.current_playlist_downloads and self.is_ytdlp_command_running():
             QMessageBox.warning(
                 self,
-                "Invalid URL",
-                "Please enter a valid URL (must start with http:// or https://)",
+                "Playlist Downloading",
+                "Cannot load a new playlist while a playlist download is in progress.",
             )
+            return
+
+        url = self.get_validated_url()
+        if url is None:
             return
 
         self.playlist_status_label.setText("Loading playlist...")
         self.list_playlist_btn.setEnabled(False)
+        self.cancel_playlist_btn.setEnabled(True)
+        self.download_playlist_btn.setEnabled(False)
+        self.check_all_playlist_btn.setEnabled(False)
+        self.uncheck_all_playlist_btn.setEnabled(False)
         self.playlist_table.setRowCount(0)
+        self.loaded_playlist_url = None
 
         args_without_url = self.build_ytdlp_args(["--flat-playlist", "-J"])
         if args_without_url is None:
             self.playlist_status_label.setText("Ready")
             self.list_playlist_btn.setEnabled(True)
+            self.cancel_playlist_btn.setEnabled(False)
             return
 
         self.playlist_fetcher = FormatFetcher(
@@ -2364,35 +788,45 @@ class YtDlpGUI(CommandMixin, QMainWindow):
             self.get_ytdlp_path(),
             args_without_url=args_without_url,
         )
+        self.track_worker_thread(self.playlist_fetcher)
         self.playlist_fetcher.finished.connect(self.on_playlist_loaded)
         self.playlist_fetcher.error.connect(self.on_playlist_error)
-
-        if self.terminal_window and self.terminal_window.isVisible():
-            self.connect_worker_output(self.playlist_fetcher, self.terminal_window)
+        self.playlist_fetcher.output.connect(self.append_terminal_output)
 
         self.playlist_fetcher.start()
 
+    def cancel_playlist_load(self):
+        """Cancel an in-progress playlist load."""
+        fetcher = self.playlist_fetcher
+        if not fetcher or not fetcher.isRunning():
+            return
+        self.cancel_playlist_btn.setEnabled(False)
+        self.playlist_status_label.setText("Cancelling playlist load...")
+        fetcher.stop()
+
     def on_playlist_loaded(self, data):
-        """Populate table with playlist items"""
+        """Populate table with playlist items."""
         fetcher = self.sender()
         if fetcher is not self.playlist_fetcher:
-            if fetcher:
-                fetcher.deleteLater()
             return
 
         self.playlist_fetcher = None
-        if fetcher:
-            fetcher.deleteLater()
         if self.is_closing:
             return
 
-        entries = data.get('entries', [])
+        entries = [entry for entry in (data.get("entries") or []) if isinstance(entry, dict)]
 
         if not entries:
+            self.loaded_playlist_url = None
             self.playlist_status_label.setText("No videos found in playlist")
             self.list_playlist_btn.setEnabled(True)
+            self.cancel_playlist_btn.setEnabled(False)
+            self.download_playlist_btn.setEnabled(False)
+            self.check_all_playlist_btn.setEnabled(False)
+            self.uncheck_all_playlist_btn.setEnabled(False)
             return
 
+        self.loaded_playlist_url = getattr(fetcher, "url", None)
         self.playlist_table.setRowCount(len(entries))
 
         for i, entry in enumerate(entries):
@@ -2403,34 +837,22 @@ class YtDlpGUI(CommandMixin, QMainWindow):
 
             status_item = QTableWidgetItem("Pending")
             status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            status_item.setForeground(QColor(self.COLORS['text_secondary']))
+            status_item.setForeground(QColor(self.COLORS["text_secondary"]))
             self.playlist_table.setItem(i, 1, status_item)
 
-            title = entry.get('title', 'Unknown')
-            self.playlist_table.setItem(i, 2, QTableWidgetItem(title))
+            self.playlist_table.setItem(i, 2, QTableWidgetItem(entry.get("title") or "Unknown"))
 
-            duration = entry.get('duration', 0)
-            if duration:
-                hours = int(duration // 3600)
-                minutes = int((duration % 3600) // 60)
-                seconds = int(duration % 60)
-                if hours > 0:
-                    duration_str = f"{hours}:{minutes:02d}:{seconds:02d}"
-                else:
-                    duration_str = f"{minutes}:{seconds:02d}"
-            else:
-                duration_str = "Unknown"
-            duration_item = QTableWidgetItem(duration_str)
+            duration_item = QTableWidgetItem(format_duration(entry.get("duration") or 0))
             duration_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.playlist_table.setItem(i, 3, duration_item)
 
-            uploader = entry.get('uploader', 'Unknown')
-            self.playlist_table.setItem(i, 4, QTableWidgetItem(uploader))
+            self.playlist_table.setItem(i, 4, QTableWidgetItem(entry.get("uploader") or "Unknown"))
 
         self.playlist_status_label.setText(
             f"Loaded {len(entries)} videos. Check videos to download"
         )
         self.list_playlist_btn.setEnabled(True)
+        self.cancel_playlist_btn.setEnabled(False)
         self.download_playlist_btn.setEnabled(
             not self.is_ytdlp_command_running() and not self.is_processing_queue
         )
@@ -2438,28 +860,39 @@ class YtDlpGUI(CommandMixin, QMainWindow):
         self.uncheck_all_playlist_btn.setEnabled(True)
 
     def on_playlist_error(self, error):
-        """Handle playlist loading error"""
+        """Handle playlist loading error."""
         fetcher = self.sender()
         if fetcher is not self.playlist_fetcher:
-            if fetcher:
-                fetcher.deleteLater()
             return
 
         self.playlist_fetcher = None
-        if fetcher:
-            fetcher.deleteLater()
         if self.is_closing:
             return
 
-        self.playlist_status_label.setText(f"Error: {error}")
+        self.loaded_playlist_url = None
         self.list_playlist_btn.setEnabled(True)
+        self.cancel_playlist_btn.setEnabled(False)
+        self.download_playlist_btn.setEnabled(False)
+        self.check_all_playlist_btn.setEnabled(False)
+        self.uncheck_all_playlist_btn.setEnabled(False)
+        if getattr(fetcher, "stop_requested", False):
+            self.playlist_status_label.setText("Playlist load cancelled")
+            return
+        self.playlist_status_label.setText(f"Error: {error}")
         QMessageBox.critical(self, "Error", f"Failed to load playlist: {error}")
 
     def download_playlist(self):
-        """Download checked playlist items"""
-        url = self.url_input.text().strip()
+        """Download checked playlist items."""
+        url = self.loaded_playlist_url or self.url_input.text().strip()
         if not url:
             QMessageBox.warning(self, "Error", "Please enter a URL first!")
+            return
+        if not self.is_valid_url(url):
+            QMessageBox.warning(
+                self,
+                "Invalid URL",
+                "Please enter a valid URL (must start with http:// or https://)",
+            )
             return
 
         checked_rows = []
@@ -2472,14 +905,8 @@ class YtDlpGUI(CommandMixin, QMainWindow):
             QMessageBox.warning(self, "Error", "Please check at least one video to download!")
             return
 
-        if self.warn_if_ytdlp_command_running():
+        if self.is_processing_queue or self.warn_if_ytdlp_command_running():
             return
-
-        for row in checked_rows:
-            status_item = self.playlist_table.item(row, 1)
-            if status_item:
-                status_item.setText("Downloading")
-                status_item.setForeground(QColor(self.COLORS['info']))
 
         items = ",".join(str(row + 1) for row in checked_rows)
 
@@ -2493,22 +920,29 @@ class YtDlpGUI(CommandMixin, QMainWindow):
                 f"bv*[height<={quality}]+ba/b[height<={quality}]"
             )
 
-        args = ["-f", format_str, "--merge-output-format", "mp4"]
-        args.extend(["-I", items])
+        args = ["-f", format_str, "--merge-output-format", "mp4", "-I", items]
 
         self.current_playlist_downloads = checked_rows
+        if not self.run_yt_dlp(args, is_download=True, url=url):
+            self.current_playlist_downloads = []
+            return
 
-        self.run_yt_dlp(args, is_download=True)
+        for row in checked_rows:
+            status_item = self.playlist_table.item(row, 1)
+            if status_item:
+                status_item.setText("Downloading")
+                status_item.setForeground(QColor(self.COLORS["info"]))
+        self.set_command_controls_enabled(False)
 
     def check_all_playlist(self):
-        """Check all playlist items"""
+        """Check all playlist items."""
         for row in range(self.playlist_table.rowCount()):
             checkbox_item = self.playlist_table.item(row, 0)
             if checkbox_item:
                 checkbox_item.setCheckState(Qt.CheckState.Checked)
 
     def uncheck_all_playlist(self):
-        """Uncheck all playlist items"""
+        """Uncheck all playlist items."""
         for row in range(self.playlist_table.rowCount()):
             checkbox_item = self.playlist_table.item(row, 0)
             if checkbox_item:
@@ -2525,7 +959,7 @@ class YtDlpGUI(CommandMixin, QMainWindow):
             return
 
         try:
-            args = shlex.split(custom_args)
+            args = split_cli_args(custom_args)
         except ValueError as e:
             QMessageBox.warning(
                 self, "Invalid Arguments", f"Could not parse custom arguments: {e}"
@@ -2551,43 +985,32 @@ class YtDlpGUI(CommandMixin, QMainWindow):
             self.advanced_output,
         )
 
-    def run_yt_dlp(self, args, output_widget=None, *, is_download=False, format_display=""):
+    def run_yt_dlp(
+        self, args, output_widget=None, *, is_download=False, format_display="", url=None
+    ):
         """Build a command and start a worker with output and progress handlers."""
         if self.warn_if_ytdlp_command_running():
             return False
 
-        url = self.url_input.text().strip()
+        target_url = url if url is not None else self.url_input.text().strip()
 
-        output_template = f"%(title)s [{format_display}].%(ext)s" if format_display else None
+        output_template = build_output_template(format_display)
         args = self.build_ytdlp_args(args, is_download=is_download, output_template=output_template)
         if args is None:
             return False
 
-        if self.terminal_window and self.terminal_window.isVisible():
-            active_output_widget = self.terminal_window
-            tab_widget = output_widget if not is_download else None
-        elif is_download:
-            active_output_widget = None
-            tab_widget = None
-        else:
-            active_output_widget = output_widget
-            tab_widget = None
+        header = (
+            f"Running: yt-dlp {' '.join(args)}\n"
+            f"URL: {target_url}\n"
+            + "-" * 60
+            + "\n"
+        )
+        self.clear_terminal_output()
+        self.append_terminal_output(header)
 
-        if active_output_widget:
-            active_output_widget.clear()
-            active_output_widget.append(f"Running: yt-dlp {' '.join(args)}\n")
-            active_output_widget.append(f"URL: {url}\n")
-            active_output_widget.append("-" * 60 + "\n")
-
-        if tab_widget and tab_widget != active_output_widget:
-            tab_widget.clear()
-            tab_widget.append("═" * 60 + "\n")
-            tab_widget.append("📺 Output is being shown in the Terminal Window\n")
-            tab_widget.append("═" * 60 + "\n\n")
-            tab_widget.append(
-                "The detailed yt-dlp output is displayed in the separate terminal window.\n"
-            )
-            tab_widget.append("You can close the terminal window to see output here instead.\n")
+        if output_widget and output_widget is not self.terminal_window:
+            output_widget.clear()
+            self.append_worker_output(output_widget, header)
 
         self.statusBar().showMessage("Running yt-dlp...")
         self.set_command_controls_enabled(False)
@@ -2598,23 +1021,37 @@ class YtDlpGUI(CommandMixin, QMainWindow):
             self.progress_bar.setTextVisible(True)
             self.status_label.setText("Starting download...")
             self.abort_btn.setEnabled(True)
+        else:
+            self.cancel_advanced_btn.setEnabled(True)
 
-        self.download_thread = DownloadThread(args, url, self.get_ytdlp_path())
+        self.download_thread = DownloadThread(args, target_url, self.get_ytdlp_path())
+        self.track_worker_thread(self.download_thread)
         self.download_thread.is_download = is_download
-        self.connect_worker_output(self.download_thread, active_output_widget)
+        self.download_thread.output.connect(self.append_terminal_output)
+        if output_widget and output_widget is not self.terminal_window:
+            self.connect_worker_output(self.download_thread, output_widget)
         if is_download:
             self.download_thread.progress.connect(self.update_progress)
         self.download_thread.finished_signal.connect(self.on_download_thread_finished)
         self.download_thread.start()
         return True
 
+    def cancel_advanced_command(self):
+        """Cancel a running non-download command started from the Advanced tab."""
+        thread = self.download_thread
+        if not thread or not thread.isRunning() or getattr(thread, "is_download", True):
+            return
+        self.cancel_advanced_btn.setEnabled(False)
+        self.statusBar().showMessage("Cancelling command...")
+        thread.stop()
+
     def update_progress(self, percentage, status):
-        """Update progress bar and status label"""
+        """Update progress bar and status label."""
         self.progress_bar.setValue(percentage)
         self.status_label.setText(status)
 
     def abort_download(self):
-        """Abort the current download"""
+        """Abort the current download."""
         if not self.download_thread or not self.download_thread.isRunning():
             return
 
@@ -2622,66 +1059,57 @@ class YtDlpGUI(CommandMixin, QMainWindow):
             self,
             "Abort Download",
             "Are you sure you want to abort the current download?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
 
         if reply == QMessageBox.StandardButton.Yes:
+            thread = self.download_thread
+            if not thread or not thread.isRunning():
+                return
             self.status_label.setText("Aborting download...")
             self.abort_btn.setEnabled(False)
+            thread.stop()
 
-            self.download_thread.stop()
+    def _update_playlist_download_statuses(self, status_text, color_key):
+        """Update playlist table status cells for the finished playlist download."""
+        for row in self.current_playlist_downloads:
+            status_item = self.playlist_table.item(row, 1)
+            if status_item:
+                status_item.setText(status_text)
+                status_item.setForeground(QColor(self.COLORS[color_key]))
+        self.current_playlist_downloads = []
 
     def on_download_finished(self, exit_code, is_download, stop_requested=False):
-        """Restore controls and update the queue after a command finishes."""
+        """Restore controls and update status after a command finishes."""
         self.download_thread = None
         if self.is_closing:
             return
 
         was_aborted = stop_requested and exit_code != 0
 
-        if self.terminal_window and self.terminal_window.isVisible():
-            self.terminal_window.append("\n" + "-" * 60 + "\n")
-            if exit_code == 0:
-                self.terminal_window.append("✓ Command completed successfully!\n")
-            elif was_aborted:
-                self.terminal_window.append("⚠ Download aborted by user\n")
-            else:
-                self.terminal_window.append(f"✗ Command failed with exit code {exit_code}\n")
-
+        self.append_terminal_output("\n" + "-" * 60 + "\n")
         if exit_code == 0:
+            self.append_terminal_output("✓ Command completed successfully!\n")
             self.statusBar().showMessage("Command completed successfully!", 5000)
             if is_download:
                 self.progress_bar.setValue(100)
                 self.status_label.setText("✓ Download completed successfully!")
                 self.abort_btn.setEnabled(False)
-                for row in self.current_playlist_downloads:
-                    status_item = self.playlist_table.item(row, 1)
-                    if status_item:
-                        status_item.setText("Completed")
-                        status_item.setForeground(QColor(self.COLORS['success']))
-                self.current_playlist_downloads = []
+                self._update_playlist_download_statuses("Completed", "success")
         elif was_aborted:
+            self.append_terminal_output("⚠ Command cancelled by user\n")
             self.statusBar().showMessage("Download aborted", 5000)
             if is_download:
                 self.status_label.setText("⚠ Download aborted by user")
                 self.abort_btn.setEnabled(False)
-                for row in self.current_playlist_downloads:
-                    status_item = self.playlist_table.item(row, 1)
-                    if status_item:
-                        status_item.setText("Aborted")
-                        status_item.setForeground(QColor(self.COLORS['warning']))
-                self.current_playlist_downloads = []
+                self._update_playlist_download_statuses("Aborted", "warning")
         else:
+            self.append_terminal_output(f"✗ Command failed with exit code {exit_code}\n")
             self.statusBar().showMessage(f"Command failed with exit code {exit_code}", 5000)
             if is_download:
                 self.status_label.setText(f"✗ Download failed with exit code {exit_code}")
                 self.abort_btn.setEnabled(False)
-                for row in self.current_playlist_downloads:
-                    status_item = self.playlist_table.item(row, 1)
-                    if status_item:
-                        status_item.setText("Failed")
-                        status_item.setForeground(QColor(self.COLORS['error']))
-                self.current_playlist_downloads = []
+                self._update_playlist_download_statuses("Failed", "error")
 
         self.set_command_controls_enabled(True)
 
@@ -2706,20 +1134,21 @@ class YtDlpGUI(CommandMixin, QMainWindow):
         if self.update_notification is not None:
             self.update_notification.close()
 
-        if self.active_thumbnail_reply:
-            try:
-                self.active_thumbnail_reply.abort()
-                self.active_thumbnail_reply.finished.disconnect(self.on_thumbnail_loaded)
-            except (RuntimeError, TypeError):
-                pass
-            self.active_thumbnail_reply.deleteLater()
-            self.active_thumbnail_reply = None
+        self._cancel_active_thumbnail_reply()
 
         download_stopped = self.stop_worker_thread(self.download_thread)
         format_fetcher_stopped = self.stop_worker_thread(self.format_fetcher)
         playlist_fetcher_stopped = self.stop_worker_thread(self.playlist_fetcher)
+        extra_threads_stopped = all(
+            self.stop_worker_thread(thread) for thread in list(self._worker_threads)
+        )
 
-        if not download_stopped or not format_fetcher_stopped or not playlist_fetcher_stopped:
+        if (
+            not download_stopped
+            or not format_fetcher_stopped
+            or not playlist_fetcher_stopped
+            or not extra_threads_stopped
+        ):
             if interactive:
                 self.is_closing = False
                 QMessageBox.warning(
@@ -2741,16 +1170,18 @@ class YtDlpGUI(CommandMixin, QMainWindow):
         if self.terminal_window:
             try:
                 self.terminal_window.closed.disconnect(self.on_terminal_closed)
+                self.terminal_window.cleared.disconnect(self.on_terminal_cleared)
             except (RuntimeError, TypeError):
                 pass
             self.terminal_window.close()
             self.terminal_window.deleteLater()
             self.terminal_window = None
+        self._terminal_buffer.clear()
 
         return True
 
     def closeEvent(self, event):
-        """Handle application close - cleanup running processes"""
+        """Handle application close - cleanup running processes."""
         if not self.cleanup_for_exit(interactive=True):
             event.ignore()
             return
@@ -2759,7 +1190,7 @@ class YtDlpGUI(CommandMixin, QMainWindow):
 
     def get_config_file_path(self):
         """Return the settings path, using a persistent user directory for packaged apps."""
-        if sys.platform == 'win32' or getattr(sys, 'frozen', False):
+        if sys.platform == "win32" or getattr(sys, "frozen", False):
             config_dir = QStandardPaths.writableLocation(
                 QStandardPaths.StandardLocation.AppConfigLocation
             )
@@ -2779,25 +1210,54 @@ class YtDlpGUI(CommandMixin, QMainWindow):
                     migrate_legacy_settings = True
 
             if config_file.exists():
-                with open(config_file, 'r', encoding='utf-8') as f:
+                with open(config_file, "r", encoding="utf-8") as f:
                     settings = json.load(f)
 
-                self.destination_input.setText(settings.get("destination", ""))
-                self.ytdlp_path_input.setText(settings.get("ytdlp_path", ""))
-                self.ffmpeg_path_input.setText(settings.get("ffmpeg_path", ""))
-                self.custom_options_input.setText(settings.get("custom_options", ""))
-                self.limit_rate_input.setText(settings.get("limit_rate", ""))
-                self.throttled_rate_input.setText(settings.get("throttled_rate", ""))
+                if not isinstance(settings, dict):
+                    raise ValueError("Settings file must contain a JSON object")
+
+                self.destination_input.setText(str(settings.get("destination") or ""))
+                self.ytdlp_path_input.setText(str(settings.get("ytdlp_path") or ""))
+                self.ffmpeg_path_input.setText(str(settings.get("ffmpeg_path") or ""))
+                self.custom_options_input.setText(str(settings.get("custom_options") or ""))
+                self.limit_rate_input.setText(str(settings.get("limit_rate") or ""))
+                self.throttled_rate_input.setText(str(settings.get("throttled_rate") or ""))
                 self.show_auto_captions_checkbox.setChecked(
-                    settings.get("show_auto_captions", False)
+                    bool(settings.get("show_auto_captions", False))
                 )
+                saved_container = str(settings.get("video_container") or "mp4")
+                container_idx = self.video_container_combo.findData(saved_container)
+                if container_idx >= 0:
+                    self.video_container_combo.setCurrentIndex(container_idx)
+                saved_audio_fmt = str(settings.get("audio_format") or "original")
+                audio_fmt_idx = self.audio_format_combo.findData(saved_audio_fmt)
+                if audio_fmt_idx >= 0:
+                    self.audio_format_combo.setCurrentIndex(audio_fmt_idx)
 
                 if migrate_legacy_settings:
                     self.config_file.parent.mkdir(parents=True, exist_ok=True)
-                    with open(self.config_file, 'w', encoding='utf-8') as f:
+                    with open(self.config_file, "w", encoding="utf-8") as f:
                         json.dump(settings, f, indent=2)
-        except (OSError, json.JSONDecodeError, TypeError) as e:
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as e:
             print(f"Error loading settings: {e}")
+
+    def mark_dependency_status_dirty(self, *_args):
+        """Mark About dependency statuses stale when tool paths or options change."""
+        self._dependency_status_dirty = True
+
+    def refresh_dependency_statuses(self, *, force=False):
+        """Re-check yt-dlp, FFmpeg, and JS runtime statuses for the About tab."""
+        if not force and not self._dependency_status_dirty:
+            return
+        self._dependency_status_dirty = False
+        self.check_ytdlp_version(show_warning=False, async_mode=True)
+        self.check_ffmpeg_version(async_mode=True)
+        self.check_js_runtime_version(async_mode=True)
+
+    def on_tab_changed(self, index):
+        """Refresh stale dependency statuses when the user opens the About tab."""
+        if self.tabs.widget(index) is getattr(self, "about_scroll_area", None):
+            self.refresh_dependency_statuses()
 
     def setup_settings_autosave(self):
         """Autosave settings shortly after option fields change."""
@@ -2816,7 +1276,12 @@ class YtDlpGUI(CommandMixin, QMainWindow):
         ):
             input_widget.textChanged.connect(self.schedule_settings_save)
 
+        self.ytdlp_path_input.textChanged.connect(self.mark_dependency_status_dirty)
+        self.ffmpeg_path_input.textChanged.connect(self.mark_dependency_status_dirty)
         self.custom_options_input.textChanged.connect(self.invalidate_js_runtime_cache)
+        self.custom_options_input.textChanged.connect(self.mark_dependency_status_dirty)
+        self.video_container_combo.currentIndexChanged.connect(self.schedule_settings_save)
+        self.audio_format_combo.currentIndexChanged.connect(self.schedule_settings_save)
 
     def schedule_settings_save(self, *_args):
         """Debounce automatic settings writes while the user is editing."""
@@ -2834,16 +1299,19 @@ class YtDlpGUI(CommandMixin, QMainWindow):
             "limit_rate": self.limit_rate_input.text(),
             "throttled_rate": self.throttled_rate_input.text(),
             "show_auto_captions": self.show_auto_captions_checkbox.isChecked(),
+            "video_container": self.video_container_combo.currentData(),
+            "audio_format": self.audio_format_combo.currentData(),
         }
 
     def save_settings(self, show_feedback=True):
         """Persist current preferences and optionally display save feedback."""
         try:
             self.config_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.config_file, 'w', encoding='utf-8') as f:
+            with open(self.config_file, "w", encoding="utf-8") as f:
                 json.dump(self.get_settings_data(), f, indent=2)
 
             if show_feedback:
+                self.refresh_dependency_statuses()
                 QMessageBox.information(self, "Success", "Settings saved successfully!")
                 self.statusBar().showMessage("Settings saved", 3000)
             else:
@@ -2853,6 +1321,7 @@ class YtDlpGUI(CommandMixin, QMainWindow):
                 QMessageBox.critical(self, "Error", f"Failed to save settings: {e}")
             else:
                 print(f"Error auto-saving settings: {e}")
+
 
 def main():
     """Create the Qt application and run it with orderly shutdown cleanup."""
@@ -2878,6 +1347,7 @@ def main():
         pass
 
     sys.exit(exit_code)
+
 
 if __name__ == "__main__":
     main()
