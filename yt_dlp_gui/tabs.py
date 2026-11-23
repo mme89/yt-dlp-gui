@@ -316,6 +316,10 @@ class TabsMixin:
         """Build format selection, subtitle controls, and download actions."""
         download_widget = QWidget()
         layout = QVBoxLayout(download_widget)
+        layout.setSpacing(8)
+
+        format_row_layout = QHBoxLayout()
+        format_row_layout.setSpacing(10)
 
         video_group = QGroupBox("Video Format")
         video_layout = QVBoxLayout()
@@ -323,7 +327,7 @@ class TabsMixin:
         self.video_combo.addItem("Fetch formats first...", "")
         video_layout.addWidget(self.video_combo)
         video_group.setLayout(video_layout)
-        layout.addWidget(video_group)
+        format_row_layout.addWidget(video_group, 3)
 
         audio_group = QGroupBox("Audio Format")
         audio_layout = QVBoxLayout()
@@ -331,7 +335,9 @@ class TabsMixin:
         self.audio_combo.addItem("Fetch formats first...", "")
         audio_layout.addWidget(self.audio_combo)
         audio_group.setLayout(audio_layout)
-        layout.addWidget(audio_group)
+        format_row_layout.addWidget(audio_group, 2)
+
+        layout.addLayout(format_row_layout)
 
         output_fmt_group = QGroupBox("Output Format")
         output_fmt_layout = QHBoxLayout()
@@ -462,7 +468,15 @@ class TabsMixin:
         layout.addWidget(progress_group)
         layout.addStretch()
 
-        self.tabs.addTab(download_widget, "Download")
+        self.download_scroll_area = QScrollArea()
+        self.download_scroll_area.setObjectName("downloadScrollArea")
+        self.download_scroll_area.setWidgetResizable(True)
+        self.download_scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.download_scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.download_scroll_area.setWidget(download_widget)
+        self.tabs.addTab(self.download_scroll_area, "Download")
 
     def create_playlist_tab(self):
         """Build playlist loading and selective download controls."""
@@ -587,6 +601,7 @@ class TabsMixin:
         self.custom_input.setToolTip(
             "Enter yt-dlp options only. The URL is appended automatically."
         )
+        self.custom_input.returnPressed.connect(self.execute_custom)
         custom_layout.addWidget(self.custom_input)
         custom_group.setLayout(custom_layout)
         layout.addWidget(custom_group)

@@ -152,19 +152,21 @@ class YtDlpGUI(ProbeMixin, CommandMixin, TabsMixin, QueueMixin, QMainWindow):
     def init_ui(self):
         """Build the main window, URL controls, and feature tabs."""
         self.setWindowTitle(f"mme89 yt-dlp GUI - v{APP_VERSION}")
-        self.setFixedSize(1200, 900)
+        self.setMinimumSize(900, 640)
+        self.resize(1200, 900)
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
 
         url_group = QGroupBox("YouTube URL")
-        url_group.setFixedHeight(280)
+        url_group.setFixedHeight(245)
         url_main_layout = QVBoxLayout()
 
         url_layout = QHBoxLayout()
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText("https://www.youtube.com/watch?v=...")
+        self.url_input.returnPressed.connect(self.fetch_formats)
         self.analyze_btn = QPushButton("Analyze")
         self.analyze_btn.clicked.connect(self.fetch_formats)
         self.cancel_analyze_btn = QPushButton("Cancel")
@@ -178,7 +180,7 @@ class YtDlpGUI(ProbeMixin, CommandMixin, TabsMixin, QueueMixin, QMainWindow):
         thumbnail_info_layout = QHBoxLayout()
 
         self.thumbnail_label = QLabel()
-        self.thumbnail_label.setFixedSize(320, 180)
+        self.thumbnail_label.setFixedSize(284, 160)
         self.thumbnail_label.setScaledContents(True)
         self.thumbnail_label.setStyleSheet(
             f"border: 1px solid {self.COLORS['border']}; "
@@ -189,7 +191,7 @@ class YtDlpGUI(ProbeMixin, CommandMixin, TabsMixin, QueueMixin, QMainWindow):
         thumbnail_info_layout.addWidget(self.thumbnail_label)
 
         info_widget = QWidget()
-        info_widget.setFixedHeight(180)
+        info_widget.setFixedHeight(160)
         info_layout = QVBoxLayout(info_widget)
         info_layout.setContentsMargins(0, 0, 0, 0)
         self.title_label = QLabel("Title: -")

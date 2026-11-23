@@ -653,6 +653,30 @@ class MainWindowFixTests(unittest.TestCase):
         self.assertIn("-x", args)
         self.assertIn("opus", args)
 
+    def test_download_tab_controls_are_not_clipped_at_default_size(self):
+        self.window.resize(1200, 900)
+        self.window.show()
+        for _ in range(5):
+            self.app.processEvents()
+
+        scroll = self.window.download_scroll_area
+        self.assertEqual(scroll.verticalScrollBar().maximum(), 0)
+        for widget in (
+            self.window.video_combo,
+            self.window.audio_combo,
+            self.window.video_container_combo,
+            self.window.audio_format_combo,
+            self.window.subtitle_combo,
+            self.window.include_live_chat_checkbox,
+            self.window.keep_subtitle_files_checkbox,
+            self.window.format_input,
+            self.window.download_btn,
+            self.window.abort_btn,
+        ):
+            self.assertGreaterEqual(widget.height(), widget.sizeHint().height())
+            bottom_right = widget.mapTo(scroll.viewport(), widget.rect().bottomRight())
+            self.assertTrue(scroll.viewport().rect().contains(bottom_right))
+
     def test_abort_download_handles_thread_finishing_during_dialog(self):
         running_thread = Mock()
         running_thread.isRunning.return_value = True
