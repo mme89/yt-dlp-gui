@@ -2,6 +2,48 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.6.0] - 2026-11-23
+
+### Added
+- Output Format selectors on the Download tab to choose video merge container (`MP4`, `MKV`, or `Original`) and audio-only format (`Original`, `MP3`, `M4A`, or `Opus`), persisted in settings
+- Cancel buttons for Analyze, Load Playlist, and Advanced tab commands
+- Press Enter in the URL field to analyze or in the custom arguments field to execute
+- Live buffered terminal output so opening the Terminal window mid-run immediately displays in-progress output
+- Combined (muxed) YouTube format support in the Video Format dropdown (`[video+audio]`) alongside codec, HDR/dynamic range, audio language, and approximate file size labels
+- Expanded automated test coverage (73 unit tests) across formatters, command building, workers, queue transitions, and settings persistence
+
+### Changed
+- Move startup and settings-refresh dependency probes (`yt-dlp`, `FFmpeg`, JS runtime) off the main Qt thread for faster, non-blocking startup
+- Upgrade the Terminal window and Advanced output view to bounded `QPlainTextEdit` widgets with the system fixed-width font
+- Terminate child process trees (`ffmpeg`, JS runtimes) when aborting or closing downloads using process groups on POSIX and `taskkill /T /F` on Windows
+- Prefer `PATH` (`shutil.which`) over hardcoded system directories when locating `yt-dlp` and `ffmpeg`
+- List all available video and audio formats instead of silently truncating at 20/15 entries
+- Use `bv*+ba/b` as the default format selector instead of deprecated `best`
+- Refresh stale About tab dependency statuses when saving settings or opening the About tab
+- Refactor `yt_dlp_gui/app.py` into focused modules (`formatters.py`, `probes.py`, `queue_controller.py`, `tabs.py`) and deduplicate URL validation, formatting, and subtitle helpers
+- Remove unused `Pillow` dependency from runtime `requirements.txt` and use `assets/logo.ico` directly in the Windows PyInstaller spec
+
+### Fixed
+- Prevent permanent UI lockup if `DownloadThread` fails to launch `yt-dlp`
+- Fix Download tab control clipping by placing Video and Audio Format side by side, wrapping the Download tab in a scroll area, and making the main window resizable
+- Fix `TypeError` crash when sorting formats with `None` height, fps, bitrate, or metadata fields
+- Sanitize manual format expressions before embedding them in `-o` output templates to prevent invalid filenames or unintended subdirectories
+- Preserve Windows backslash paths when splitting custom CLI arguments
+- Fix `AttributeError` crash when a download finishes while the Abort confirmation dialog is open
+- Fix cross-thread `self.process` races and unsafe `QThread` teardown during worker completion
+- Prevent `QProcess` timeouts on Linux/macOS from being misreported as installed tools
+- Pass `--no-playlist` on single-video Analyze and Download operations so `watch?v=...&list=...` URLs do not fetch or download entire playlists
+- Fix queue state bugs (allow queuing while running, block clearing during active processing, enable Abort during queue downloads, avoid modal dialog races, prevent stale titles/sizes)
+- Fix Playlist tab state bugs (download the loaded playlist URL, validate URLs, block reloads during active playlist downloads, revert status on start failure)
+- Fix thumbnail reply race conditions and clear stale thumbnails when a video has none
+- Fix subtitle edge cases (skip `--embed-subs` on audio-only downloads, respect unchecked "Keep subtitle files" for auto-captions, avoid 429 floods on "All subtitles")
+- Resolve PyInstaller frozen asset and legacy `settings.json` paths using `sys._MEIPASS` and `sys.executable`
+- Stop applying download-only flags (`-P`, `--limit-rate`, `--throttled-rate`) to metadata/inspection commands
+- Fix `is_valid_url()` to accept TLDs longer than 6 characters and IPv6 addresses
+- Eliminate double-spaced lines in Terminal and Advanced output and include concise `stderr` error details on fetch failures
+- Handle non-dict JSON in `settings.json` gracefully without crashing startup
+- Label vertical Shorts by their short side (`1080x1920` → `1080p`) and fix minor JS runtime / dated yt-dlp version parsing gaps
+
 ## [1.5.1] - 2026-10-27
 
 ### Changed
